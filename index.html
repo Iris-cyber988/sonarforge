@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>SonarForge AI — Accessible Ultrasound Simulation</title>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
+<script type="text/python" id="core-src">
+"""
+sonarforge_core.py
+==================
+Stack-agnostic physics engine for the SonarForge AI ultrasound field explorer.
+
+Design goals
+------------
+* Pure NumPy, no heavy deps -> runs in a browser via pyodide, in a FastAPI
+  backend, or in a Streamlit/Gradio app unchanged.
+* Every public function is deterministic and returns plain dicts / ndarrays so
+  the frontend layer never needs to know the physics.
+* Analytic + semi-analytic models only (KLM-style resonance, Rayleigh-Sommerfeld
+  coherent field, closed-form resolution, linear attenuation + speckle) --
+  the "accessible / instant" tradeoff described in the abstract.
+
+Author: physics core handed off to Claude Code for the app layer.
+"""
+from __future__ import annotations
+from dataclasses import dataclass, field, asdict
+import numpy as np
+
+C_TISSUE = 1540.0          # m/s, default soft-tissue sound speed
+RHO_TISSUE = 1000.0        # kg/m^3
+ATTEN_DB_CM_MHZ = 0.5      # dB/cm/MHz power-law attenuation (soft tissue)
+
+# ---- piezo material library (thickness-mode sound speed, coupling, eps_r) ----
+MATERIALS = {
+    "PZT-5H":       dict(ct=4000.0, kt=0.50, eps_r=3400, rho=7500),
+    "PMN-PT":       dict(ct=4600.0, kt=0.58, eps_r=5000, rho=8100),
+    "Piezocomposite": dict(ct=3200.0, kt=0.62, eps_r=1200, rho=3500),
+}
+
+GEOMETRIES = ("linear", "phased", "convex")
+
+
+@dataclass
+class Transducer:
+    geometry: str = "linear"          # linear | phased | convex
+    material: str = "PZT-5H"
+    f0: float = 5.0e6                  # center frequency [Hz]
+    bw: float = 0.60                  # fractional -6 dB bandwidth
+    n_elem: int = 64                  # elements (or rings for annular)
+    pitch: float = None               # element pitch [m]; if None -> aperture/n
+    aperture: float = 26e-3           # total lateral aperture [m]
+    elev_h: float = 5e-3              # elevation height [m]
+    focus: float = 50e-3             # transmit focus / elevation lens depth [m]
+    roc: float = None                 # radius of curvature (convex) [m]
+    thickness: float = None           # piezo thickness [m]; if None -> from f0
+    c: float = C_TISSUE               # medium sound speed [m/s]
+
+    def resolve(self) -> "Transducer":
+        """Fill derived / defaulted geometry so downstream code sees a full spec."""
+        if self.pitch is None:
+            self.pitch = self.aperture / self.n_elem
+        else:
+            self.aperture = self.pitch * self.n_elem
+        mat = MATERIALS[self.material]
+        if self.thickness is None:
+            # half-wave thickness resonance: f_a = ct / (2 t)
+            self.thickness = mat["ct"] / (2 * self.f0)
+        return self
+
+    @property
+    def wavelength(self) -> float:
+        return self.c / self.f0
+
+
+# ----------------------------------------------------------------------------
+#  1. Closed-form resolution estimates (the "instant" summary cards)
+# ----------------------------------------------------------------------------
+def resolution_estimates(t: Transducer) -> dict:
+    t = t.resolve()
+    lam = t.wavelength
+    fnum_lat = t.focus / t.aperture
+    fnum_elev = t.focus / t.elev_h
+    return dict(
+        wavelength_mm=lam * 1e3,
+        fnum_lateral=fnum_lat,
+        fnum_elevation=fnum_elev,
+        # two-way (pulse-echo) lateral resolution: 0.886 * lambda * F#
+        lateral_fwhm_mm=0.886 * lam * fnum_lat * 1e3,
+        elevation_fwhm_mm=0.886 * lam * fnum_elev * 1e3,
+        # axial resolution from bandwidth: c / (2 * BW * f0)
+        axial_fwhm_mm=t.c / (2 * t.bw * t.f0) * 1e3,
+    )
+
+
+# ----------------------------------------------------------------------------
+#  2. KLM-style thickness resonance + Butterworth-Van Dyke impedance
+# ----------------------------------------------------------------------------
+def resonance(t: Transducer) -> dict:
+    t = t.resolve()
+    mat = MATERIALS[t.material]
+    fa = mat["ct"] / (2 * t.thickness)      # anti-resonance (thickness mode)
+    kt = mat["kt"]
+    # resonance below anti-resonance, related by coupling (1D approx)
+    fr = fa * np.sqrt(max(1e-6, 1 - (8 / np.pi**2) * kt**2))
+    return dict(f_resonance_hz=fr, f_antires_hz=fa,
+                thickness_um=t.thickness * 1e6, kt=kt)
+
+
+def bvd_impedance(t: Transducer, freqs=None) -> dict:
+    """Butterworth-Van Dyke equivalent-circuit electrical impedance."""
+    t = t.resolve()
+    mat = MATERIALS[t.material]
+    r = resonance(t)
+    fr, fa = r["f_resonance_hz"], r["f_antires_hz"]
+    if freqs is None:
+        freqs = np.linspace(0.4 * t.f0, 1.6 * t.f0, 600)
+    w = 2 * np.pi * freqs
+    # static (clamped) capacitance from geometry
+    area = t.aperture * t.elev_h
+    C0 = 8.854e-12 * mat["eps_r"] * area / t.thickness
+    wr, wa = 2 * np.pi * fr, 2 * np.pi * fa
+    C1 = C0 * (wa**2 / wr**2 - 1)
+    L1 = 1.0 / (wr**2 * C1)
+    R1 = np.sqrt(L1 / C1) / 25.0            # motional resistance (Q~25)
+    Zm = R1 + 1j * (w * L1 - 1.0 / (w * C1))
+    Zc = 1.0 / (1j * w * C0)
+    Z = (Zm * Zc) / (Zm + Zc)
+    return dict(freqs_hz=freqs, Z_real=Z.real, Z_imag=Z.imag,
+                mag=np.abs(Z), C0_pf=C0 * 1e12)
+
+
+# ----------------------------------------------------------------------------
+#  3. Rayleigh-Sommerfeld coherent field (the beam maps)
+# ----------------------------------------------------------------------------
+def _sources(t: Transducer, n_sub_x=4, n_sub_y=9):
+    """Point-source cloud approximating the (possibly curved) aperture."""
+    t = t.resolve()
+    el = (np.arange(t.n_elem) - (t.n_elem - 1) / 2) * t.pitch
+    xs, ys, zs = [], [], []
+    for xc in el:
+        sx = xc + (np.arange(n_sub_x) - (n_sub_x - 1) / 2) * (t.pitch * 0.9 / n_sub_x)
+        sy = (np.arange(n_sub_y) - (n_sub_y - 1) / 2) * (t.elev_h / n_sub_y)
+        XX, YY = np.meshgrid(sx, sy)
+        X = XX.ravel(); Y = YY.ravel()
+        Z = np.zeros_like(X)
+        if t.geometry == "convex" and t.roc:
+            # wrap the element lateral position onto a cylinder of radius roc
+            ang = X / t.roc
+            X = t.roc * np.sin(ang)
+            Z = t.roc * (1 - np.cos(ang))
+        xs.append(X); ys.append(Y); zs.append(Z)
+    return np.concatenate(xs), np.concatenate(ys), np.concatenate(zs)
+
+
+def _focus_weights(sx, sy, sz, t: Transducer, steer_deg=0.0):
+    k = 2 * np.pi / t.wavelength
+    th = np.deg2rad(steer_deg)
+    fx = t.focus * np.sin(th)
+    fz = t.focus * np.cos(th)
+    r = np.sqrt((sx - fx) ** 2 + sy ** 2 + (sz - fz) ** 2)
+    return np.exp(1j * k * r)          # delay-and-sum focusing phases
+
+
+def field_map(t: Transducer, plane="xz", steer_deg=0.0,
+              extent=None, nx=200, nz=260):
+    """Return |p| field on a plane. plane in {'xz','yz'}."""
+    t = t.resolve()
+    k = 2 * np.pi / t.wavelength
+    sx, sy, sz = _sources(t)
+    w = _focus_weights(sx, sy, sz, t, steer_deg)
+    if extent is None:
+        half = max(t.aperture, t.elev_h)
+        extent = (-1.2 * half, 1.2 * half, 0.2 * t.focus, 1.6 * t.focus)
+    a0, a1, z0, z1 = extent
+    zg = np.linspace(z0, z1, nz)
+    ag = np.linspace(a0, a1, nx)
+    A, Z = np.meshgrid(ag, zg)
+    if plane == "xz":
+        PX, PY, PZ = A.ravel(), np.zeros(A.size), Z.ravel()
+    else:  # yz
+        PX, PY, PZ = np.zeros(A.size), A.ravel(), Z.ravel()
+    # chunk to bound memory (small blocks + float32 so this runs in Pyodide/WASM)
+    out = np.empty(PX.size)
+    sx32 = sx.astype(np.float32); sy32 = sy.astype(np.float32); sz32 = sz.astype(np.float32)
+    wr = w.real.astype(np.float32); wi = w.imag.astype(np.float32)
+    k32 = np.float32(k)
+    B = 1024
+    for i in range(0, PX.size, B):
+        dx = PX[i:i+B, None].astype(np.float32) - sx32
+        dy = PY[i:i+B, None].astype(np.float32) - sy32
+        dz = PZ[i:i+B, None].astype(np.float32) - sz32
+        R = np.sqrt(dx*dx + dy*dy + dz*dz)
+        ph = k32 * R
+        cs = np.cos(ph); sn = np.sin(ph)
+        inv = 1.0 / R
+        # Re/Im of sum( w * exp(-j k R) / R )
+        re = np.sum((wr*cs + wi*sn) * inv, axis=1)
+        im = np.sum((wi*cs - wr*sn) * inv, axis=1)
+        out[i:i+B] = np.sqrt(re*re + im*im)
+    P = out.reshape(Z.shape)
+    P /= P.max()
+    return dict(field=P, extent=(a0*1e3, a1*1e3, z1*1e3, z0*1e3),
+                plane=plane, axis_mm=ag*1e3, depth_mm=zg*1e3)
+
+
+def psf_lateral(t: Transducer, depth=None, steer_deg=0.0, n=801, half_mm=6.0):
+    t = t.resolve()
+    if depth is None:
+        depth = t.focus
+    k = 2 * np.pi / t.wavelength
+    sx, sy, sz = _sources(t)
+    w = _focus_weights(sx, sy, sz, t, steer_deg)
+    x = np.linspace(-half_mm*1e-3, half_mm*1e-3, n)
+    sx32 = sx.astype(np.float32); sy32 = sy.astype(np.float32); sz32 = sz.astype(np.float32)
+    wr = w.real.astype(np.float32); wi = w.imag.astype(np.float32)
+    k32 = np.float32(k)
+    p = np.empty(n)
+    B = 256
+    for i in range(0, n, B):
+        dx = x[i:i+B, None].astype(np.float32) - sx32
+        dz = np.float32(depth) - sz32
+        R = np.sqrt(dx*dx + sy32*sy32 + dz*dz)
+        ph = k32 * R; cs = np.cos(ph); sn = np.sin(ph); inv = 1.0/R
+        re = np.sum((wr*cs + wi*sn) * inv, axis=1)
+        im = np.sum((wi*cs - wr*sn) * inv, axis=1)
+        p[i:i+B] = np.sqrt(re*re + im*im)
+    p /= p.max()
+    half = p >= 0.5
+    fwhm_mm = (x[half][-1] - x[half][0]) * 1e3 if half.any() else np.nan
+    return dict(x_mm=x*1e3, p=p, p_db=20*np.log10(p+1e-6), fwhm_mm=fwhm_mm)
+
+
+# ----------------------------------------------------------------------------
+#  4. B-mode phantom (wire + anechoic cyst + speckle), convolution model
+# ----------------------------------------------------------------------------
+def bmode_phantom(t: Transducer, depth_span=(20e-3, 80e-3), width=40e-3,
+                  seed=0, nz=400, nx=256):
+    t = t.resolve()
+    rng = np.random.default_rng(seed)
+    z = np.linspace(*depth_span, nz)
+    x = np.linspace(-width/2, width/2, nx)
+    # scatterer reflectivity map
+    refl = rng.standard_normal((nz, nx)) * 0.5
+    # anechoic cyst
+    cz, cx, cr = 50e-3, 0.0, 6e-3
+    ZZ, XX = np.meshgrid(z, x, indexing="ij")
+    refl[(ZZ-cz)**2 + (XX-cx)**2 < cr**2] *= 0.05
+    # bright wire target
+    wi = np.argmin(np.abs(z-35e-3)); wj = np.argmin(np.abs(x-0))
+    refl[wi-1:wi+2, wj-1:wj+2] += 6.0
+    # depth-dependent PSF (lateral widens with depth via F# at that depth)
+    res = resolution_estimates(t)
+    dz_mm = (z[1]-z[0])*1e3; dx_mm = (x[1]-x[0])*1e3
+    ax_sig = (res["axial_fwhm_mm"]/2.355)/dz_mm
+    img = np.zeros_like(refl)
+    for i in range(nz):
+        lat_fwhm = 0.886*t.wavelength*(z[i]/t.aperture)*1e3
+        lat_sig = max(0.6, (lat_fwhm/2.355)/dx_mm)
+        # separable Gaussian PSF row-wise (cheap)
+        kx = np.exp(-0.5*((np.arange(-15,16))/lat_sig)**2); kx/=kx.sum()
+        img[i] = np.convolve(refl[i], kx, mode="same")
+    # axial blur
+    kz = np.exp(-0.5*((np.arange(-15,16))/ax_sig)**2); kz/=kz.sum()
+    for j in range(nx):
+        img[:, j] = np.convolve(img[:, j], kz, mode="same")
+    env = np.abs(img)
+    # attenuation TGC-uncompensated shading
+    atten = 10**(-(ATTEN_DB_CM_MHZ*(t.f0/1e6)*(z*1e2))/20)[:, None]
+    env *= atten
+    env /= env.max()
+    log = 20*np.log10(env + 1e-4)
+    dr = 50.0
+    disp = np.clip((log + dr)/dr, 0, 1)
+    return dict(image=disp, x_mm=x*1e3, z_mm=z*1e3)
+
+
+# ----------------------------------------------------------------------------
+#  5. Design advisor (feasibility + plain-language interpretation)
+# ----------------------------------------------------------------------------
+def design_advisor(t: Transducer, target_depth=None, target_size=None) -> dict:
+    t = t.resolve()
+    res = resolution_estimates(t)
+    lam = t.wavelength
+    notes, warnings = [], []
+    feasible = True
+
+    # grating lobe check (steered arrays need pitch <= lambda/2)
+    ratio = t.pitch / (lam / 2)
+    if ratio > 1.0:
+        msg = (f"Pitch is {ratio:.1f}x lambda/2 -> grating lobes appear when "
+               f"steering. OK for a non-steered linear probe, problematic for phased.")
+        (warnings if t.geometry == "phased" else notes).append(msg)
+        if t.geometry == "phased":
+            feasible = False
+
+    # can we resolve the target?
+    if target_size:
+        if res["lateral_fwhm_mm"] > target_size * 1e3:
+            warnings.append(
+                f"Lateral resolution {res['lateral_fwhm_mm']:.2f} mm is coarser "
+                f"than the {target_size*1e3:.1f} mm target -> won't resolve it. "
+                f"Increase frequency or aperture.")
+            feasible = False
+        else:
+            notes.append(
+                f"Lateral resolution {res['lateral_fwhm_mm']:.2f} mm resolves the "
+                f"{target_size*1e3:.1f} mm target.")
+
+    # penetration vs frequency
+    if target_depth:
+        # ~ -60 dB one-way penetration budget
+        max_depth_cm = 60 / (2*ATTEN_DB_CM_MHZ*(t.f0/1e6))
+        if target_depth*1e2 > max_depth_cm:
+            warnings.append(
+                f"At {t.f0/1e6:.1f} MHz, ~{max_depth_cm:.0f} cm penetration budget "
+                f"< {target_depth*1e2:.0f} cm target depth -> lower the frequency.")
+            feasible = False
+        else:
+            notes.append(f"{t.f0/1e6:.1f} MHz reaches {target_depth*1e2:.0f} cm depth.")
+
+    return dict(feasible=feasible, warnings=warnings, notes=notes,
+                summary_cards=dict(
+                    sanity="Feasible" if feasible else "Check design",
+                    lateral_fwhm_mm=round(res["lateral_fwhm_mm"], 3),
+                    resonance_mhz=round(resonance(t)["f_resonance_hz"]/1e6, 2),
+                    advisor=(warnings[0] if warnings else "Design looks balanced"),
+                ))
+
+
+def full_report(t: Transducer, target_depth=None, target_size=None) -> dict:
+    """One call the frontend can hit for the summary layer."""
+    t = t.resolve()
+    return dict(spec=asdict(t),
+                resolution=resolution_estimates(t),
+                resonance=resonance(t),
+                advisor=design_advisor(t, target_depth, target_size))
+
+</script>
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--edge:#30363d;--txt:#e6edf3;--muted:#8b949e;
+        --accent:#2f81f7;--ok:#3fb950;--warn:#d29922;--bad:#f85149;}
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;
+       background:var(--bg);color:var(--txt)}
+  header{padding:12px 20px;border-bottom:1px solid var(--edge);display:flex;
+         align-items:center;gap:14px}
+  header h1{font-size:17px;margin:0;font-weight:650}
+  header .tag{color:var(--muted);font-size:12px}
+  #status{margin-left:auto;font-size:12px;color:var(--warn)}
+  .wrap{display:grid;grid-template-columns:290px 1fr;gap:0;height:calc(100vh - 52px)}
+  .side{background:var(--panel);border-right:1px solid var(--edge);padding:14px 16px;
+        overflow:auto}
+  .side h2{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);
+           margin:16px 0 8px}
+  .fld{margin-bottom:9px}
+  .fld label{display:block;font-size:12px;color:var(--muted);margin-bottom:2px}
+  .fld input,.fld select{width:100%;background:#0d1117;color:var(--txt);
+        border:1px solid var(--edge);border-radius:6px;padding:5px 7px;font-size:13px}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .main{overflow:auto;padding:16px 18px}
+  .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}
+  .card{background:var(--panel);border:1px solid var(--edge);border-radius:10px;
+        padding:12px 14px}
+  .card .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+  .card .v{font-size:22px;font-weight:650;margin-top:4px}
+  .card .u{font-size:12px;color:var(--muted)}
+  .card.ok{border-color:#238636}.card.bad{border-color:#8b2a25}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .plot{background:var(--panel);border:1px solid var(--edge);border-radius:10px;
+        padding:8px;height:42vh;min-height:320px}
+  .plot .js-plotly-plot,.plot .plot-container{width:100%!important;height:100%!important}
+  #pBMODE{height:46vh;min-height:360px}
+  .advisor{background:var(--panel);border:1px solid var(--edge);border-radius:10px;
+           padding:12px 16px;margin-top:14px;font-size:13px}
+  .advisor .warn{color:var(--warn)} .advisor .note{color:var(--muted)}
+  .modebar{display:flex;gap:6px;margin-bottom:8px}
+  .modebar button{flex:1;background:#0d1117;border:1px solid var(--edge);color:var(--txt);
+        padding:6px;border-radius:6px;cursor:pointer;font-size:12px}
+  .modebar button.on{background:var(--accent);border-color:var(--accent)}
+  .foot{color:var(--muted);font-size:11px;margin-top:14px;line-height:1.6}
+  .spin{display:inline-block;width:11px;height:11px;border:2px solid var(--muted);
+        border-top-color:transparent;border-radius:50%;animation:s .7s linear infinite;
+        vertical-align:-1px;margin-right:5px}
+  @keyframes s{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<header>
+  <h1>SonarForge&nbsp;AI</h1>
+  <span class="tag">accessible ultrasound field &amp; transducer explorer</span>
+  <span id="status"><span class="spin"></span>booting Pyodide…</span>
+</header>
+
+<div class="wrap">
+  <!-- ============ PARAMETER PANEL ============ -->
+  <aside class="side">
+    <div class="modebar">
+      <button id="mSimple" class="on">Simple</button>
+      <button id="mExpert">Expert</button>
+    </div>
+
+    <h2>Geometry</h2>
+    <div class="fld"><label>Array type</label>
+      <select id="geometry">
+        <option value="linear">Linear</option>
+        <option value="phased">Phased</option>
+        <option value="convex">Convex</option>
+      </select></div>
+    <div class="row2">
+      <div class="fld"><label>Elements</label><input id="n_elem" type="number" value="64" min="8" max="256"></div>
+      <div class="fld"><label>Aperture (mm)</label><input id="aperture" type="number" value="26" step="1"></div>
+    </div>
+    <div class="row2">
+      <div class="fld"><label>Elev. height (mm)</label><input id="elev_h" type="number" value="5" step="0.5"></div>
+      <div class="fld"><label>Focus (mm)</label><input id="focus" type="number" value="50" step="1"></div>
+    </div>
+
+    <h2>Excitation</h2>
+    <div class="row2">
+      <div class="fld"><label>f0 (MHz)</label><input id="f0" type="number" value="5" step="0.5"></div>
+      <div class="fld"><label>Bandwidth</label><input id="bw" type="number" value="0.6" step="0.05"></div>
+    </div>
+    <div class="fld"><label>Steering angle (°)</label>
+      <input id="steer" type="range" min="-30" max="30" value="0" step="1">
+      <span id="steerVal" class="u">0°</span></div>
+
+    <h2>Material</h2>
+    <div class="fld"><label>Piezo</label>
+      <select id="material">
+        <option>PZT-5H</option><option>PMN-PT</option><option>Piezocomposite</option>
+      </select></div>
+
+    <h2>Imaging target</h2>
+    <div class="row2">
+      <div class="fld"><label>Depth (mm)</label><input id="tdepth" type="number" value="60" step="5"></div>
+      <div class="fld"><label>Size (mm)</label><input id="tsize" type="number" value="0.8" step="0.1"></div>
+    </div>
+
+    <div class="foot" id="limits"></div>
+  </aside>
+
+  <!-- ============ RESULTS ============ -->
+  <main class="main">
+    <div class="cards" id="cards"></div>
+    <div class="grid">
+      <div class="plot" id="pXZ"></div>
+      <div class="plot" id="pYZ"></div>
+      <div class="plot" id="pPSF"></div>
+      <div class="plot" id="pBVD"></div>
+      <div class="plot" id="pBMODE" style="grid-column:1/3"></div>
+    </div>
+    <div class="advisor" id="advisor"></div>
+  </main>
+</div>
+
+<script type="module">
+const $ = id => document.getElementById(id);
+const status = $("status");
+let pyodide, core, mode="simple", ready=false;
+let timer=null;
+
+// matplotlib "inferno" colormap as an explicit Plotly colorscale
+// (Plotly.js has no built-in Inferno, so we define it to match figure 2)
+const INFERNO = [
+  [0.0,"#000004"],[0.09,"#1b0c41"],[0.18,"#4a0c6b"],[0.27,"#781c6d"],
+  [0.36,"#a52c60"],[0.45,"#cf4446"],[0.54,"#ed6925"],[0.63,"#fb9a06"],
+  [0.72,"#f7d13d"],[0.85,"#fcffa4"],[1.0,"#fcffa4"]];
+
+// ---- load core physics from sibling file (same dir) ----
+function fail(msg){
+  status.textContent = "error — see message";
+  status.style.color = "var(--bad)";
+  document.getElementById("cards").innerHTML =
+    `<div class="card bad" style="grid-column:1/5"><div class="k">Startup error</div>`+
+    `<div style="font-size:13px;margin-top:6px;white-space:pre-wrap;color:#f85149">`+
+    msg+`</div></div>`;
+  console.error(msg);
+}
+async function boot(){
+  try{
+    pyodide = await loadPyodide();
+    status.innerHTML = '<span class="spin"></span>loading NumPy…';
+    await pyodide.loadPackage("numpy");
+    status.innerHTML = '<span class="spin"></span>loading physics core…';
+    const src = document.getElementById("core-src").textContent;
+    if(!src || !src.includes("class Transducer")){
+      return fail(`Embedded physics core not found inside index.html. `+
+        `Re-download the single-file index.html and reload.`);
+    }
+    pyodide.FS.writeFile("sonarforge_core.py", src);
+    core = pyodide.pyimport("sonarforge_core");
+    ready = true;
+    status.textContent = "ready";
+    status.style.color = "var(--ok)";
+    compute(true);
+  }catch(e){
+    fail("Startup failed:\n" + (e && e.message ? e.message : String(e)));
+  }
+}
+
+function specFromUI(){
+  return {
+    geometry: $("geometry").value,
+    material: $("material").value,
+    f0: parseFloat($("f0").value)*1e6,
+    bw: parseFloat($("bw").value),
+    n_elem: parseInt($("n_elem").value),
+    aperture: parseFloat($("aperture").value)*1e-3,
+    elev_h: parseFloat($("elev_h").value)*1e-3,
+    focus: parseFloat($("focus").value)*1e-3,
+    steer: parseFloat($("steer").value),
+    tdepth: parseFloat($("tdepth").value)*1e-3,
+    tsize: parseFloat($("tsize").value)*1e-3,
+  };
+}
+
+// Build the transducer + pull every result as JSON, in one python round-trip.
+function runPython(s, nx, nz){
+  const code = `
+import json, numpy as np, sonarforge_core as sf
+t = sf.Transducer(geometry=${JSON.stringify(s.geometry)}, material=${JSON.stringify(s.material)},
+                  f0=${s.f0}, bw=${s.bw}, n_elem=${s.n_elem}, aperture=${s.aperture},
+                  elev_h=${s.elev_h}, focus=${s.focus}).resolve()
+rep = sf.full_report(t, target_depth=${s.tdepth}, target_size=${s.tsize})
+xz = sf.field_map(t, plane="xz", steer_deg=${s.steer}, nx=${nx}, nz=${nz})
+yz = sf.field_map(t, plane="yz", nx=${nx}, nz=${nz})
+psf = sf.psf_lateral(t, steer_deg=${s.steer})
+psf0= sf.psf_lateral(t, steer_deg=0)
+bvd = sf.bvd_impedance(t)
+bm  = sf.bmode_phantom(t, nz=${Math.min(nz,300)}, nx=${Math.min(nx,220)})
+def db(a): return (20*np.log10(np.asarray(a)+1e-3)).tolist()
+out = dict(
+  cards=rep["advisor"]["summary_cards"], feasible=rep["advisor"]["feasible"],
+  resolution=rep["resolution"], resonance=rep["resonance"],
+  notes=rep["advisor"]["notes"], warnings=rep["advisor"]["warnings"],
+  xz=dict(z=db(xz["field"]), x=xz["axis_mm"].tolist(), y=xz["depth_mm"].tolist()),
+  yz=dict(z=db(yz["field"]), x=yz["axis_mm"].tolist(), y=yz["depth_mm"].tolist()),
+  psf=dict(x=psf["x_mm"].tolist(), p=psf["p_db"].tolist(), fwhm=float(psf["fwhm_mm"]),
+           x0=psf0["x_mm"].tolist(), p0=psf0["p_db"].tolist(), fwhm0=float(psf0["fwhm_mm"])),
+  bvd=dict(f=(bvd["freqs_hz"]/1e6).tolist(), mag=bvd["mag"].tolist(),
+           fr=rep["resonance"]["f_resonance_hz"]/1e6, fa=rep["resonance"]["f_antires_hz"]/1e6),
+  bm=dict(img=bm["image"].tolist(), x=[float(bm["x_mm"][0]),float(bm["x_mm"][-1])],
+          z=[float(bm["z_mm"][0]),float(bm["z_mm"][-1])]),
+)
+json.dumps(out)`;
+  return JSON.parse(pyodide.runPython(code));
+}
+
+function compute(highres=false){
+  if(!ready) return;
+  const s = specFromUI();
+  const nx = highres?200:120, nz = highres?260:150;
+  status.innerHTML='<span class="spin"></span>computing…'; status.style.color="var(--warn)";
+  // let the spinner paint before the (blocking) WASM call
+  setTimeout(()=>{
+    const t0=performance.now();
+    const r = runPython(s, nx, nz);
+    render(r, s);
+    status.textContent = `ready · ${((performance.now()-t0)/1000).toFixed(1)}s${highres?'':' (preview)'}`;
+    status.style.color="var(--ok)";
+    if(!highres){ clearTimeout(timer); timer=setTimeout(()=>compute(true), 350); }
+  }, 20);
+}
+
+const heat = (div,d,title,xlab,ylab)=>Plotly.react(div,[{z:d.z,x:d.x,y:d.y,type:"heatmap",
+    zmin:-40,zmax:0,colorscale:INFERNO,colorbar:{title:"dB",thickness:10}}],
+    {title:{text:title,font:{size:13,color:"#e6edf3"}},margin:{l:52,r:10,t:34,b:44},
+     paper_bgcolor:"#161b22",plot_bgcolor:"#000004",font:{color:"#8b949e",size:11},
+     xaxis:{title:xlab},yaxis:{title:ylab,autorange:"reversed"}},{displayModeBar:false,responsive:true});
+
+function render(r,s){
+  if(typeof Plotly==="undefined"){
+    return fail("Plotly plotting library failed to load from CDN.\n"+
+      "The physics engine ran fine (cards computed), but the charts need Plotly.\n"+
+      "Check your network / try reloading, or open index.html over a local server.");
+  }
+  // ---- cards ----
+  const R=r.resolution;
+  $("cards").innerHTML = [
+    ["Sanity", r.cards.sanity, "", r.feasible?"ok":"bad"],
+    ["Lateral FWHM", R.lateral_fwhm_mm.toFixed(2), "mm (two-way)"],
+    ["Resonance", (r.resonance.f_resonance_hz/1e6).toFixed(2), "MHz"],
+    ["Axial FWHM", R.axial_fwhm_mm.toFixed(2), "mm"],
+  ].map(([k,v,u,cls])=>`<div class="card ${cls||''}"><div class="k">${k}</div>
+     <div class="v">${v}</div><div class="u">${u||''}</div></div>`).join("");
+
+  // ---- fields ----
+  heat($("pXZ"), r.xz, "Acoustic field  x–z [dB]", "lateral x [mm]", "depth z [mm]");
+  heat($("pYZ"), r.yz, "Elevation field  y–z [dB]", "elev y [mm]", "depth z [mm]");
+
+  // ---- PSF ----
+  Plotly.react($("pPSF"),[
+    {x:r.psf.x0,y:r.psf.p0,name:`on-axis ${r.psf.fwhm0.toFixed(2)}mm`,line:{color:"#2f81f7"}},
+    {x:r.psf.x,y:r.psf.p,name:`steer ${s.steer}° ${r.psf.fwhm.toFixed(2)}mm`,line:{color:"#d29922"}},
+  ],{title:{text:"Lateral PSF",font:{size:13,color:"#e6edf3"}},
+     margin:{l:44,r:10,t:34,b:40},paper_bgcolor:"#161b22",plot_bgcolor:"#161b22",
+     font:{color:"#8b949e",size:11},yaxis:{range:[-50,2],title:"dB"},xaxis:{title:"x [mm]"},
+     legend:{font:{size:10}}},{displayModeBar:false,responsive:true});
+
+  // ---- BVD ----
+  Plotly.react($("pBVD"),[{x:r.bvd.f,y:r.bvd.mag,line:{color:"#3fb950"}}],
+    {title:{text:"BVD electrical |Z|",font:{size:13,color:"#e6edf3"}},
+     margin:{l:54,r:10,t:34,b:40},paper_bgcolor:"#161b22",plot_bgcolor:"#161b22",
+     font:{color:"#8b949e",size:11},yaxis:{type:"log",title:"|Z| Ω"},xaxis:{title:"MHz"},
+     shapes:[{type:"line",x0:r.bvd.fr,x1:r.bvd.fr,y0:0,y1:1,yref:"paper",
+              line:{color:"#8b949e",dash:"dot"}},
+             {type:"line",x0:r.bvd.fa,x1:r.bvd.fa,y0:0,y1:1,yref:"paper",
+              line:{color:"#f85149",dash:"dot"}}]},{displayModeBar:false,responsive:true});
+
+  // ---- B-mode ----
+  const bmx=[r.bm.x[0],r.bm.x[1]], bmz=[r.bm.z[0],r.bm.z[1]];
+  Plotly.react($("pBMODE"),[{z:r.bm.img,type:"heatmap",
+     x0:bmx[0],dx:(bmx[1]-bmx[0])/(r.bm.img[0].length-1),
+     y0:bmz[0],dy:(bmz[1]-bmz[0])/(r.bm.img.length-1),
+     colorscale:[[0,"#000000"],[1,"#ffffff"]],showscale:false}],
+    {title:{text:"B-mode phantom (wire + cyst + speckle)",font:{size:13,color:"#e6edf3"}},
+     margin:{l:52,r:10,t:34,b:44},paper_bgcolor:"#161b22",plot_bgcolor:"#000000",
+     font:{color:"#8b949e",size:11},yaxis:{autorange:"reversed",title:"depth z [mm]"},
+     xaxis:{title:"lateral x [mm]"}},{displayModeBar:false,responsive:true});
+
+  // ---- advisor ----
+  const notes = r.notes.map(n=>`<div class="note">• ${n}</div>`).join("");
+  const warns = r.warnings.map(w=>`<div class="warn">⚠ ${w}</div>`).join("");
+  $("advisor").innerHTML = `<b>Design advisor</b><br>${warns}${notes}` +
+    (mode==="expert" ? `<div class="note" style="margin-top:8px">
+      F# lat ${R.fnum_lateral.toFixed(2)} · F# elev ${R.fnum_elevation.toFixed(1)} ·
+      λ ${R.wavelength_mm.toFixed(3)} mm · elev FWHM ${R.elevation_fwhm_mm.toFixed(2)} mm ·
+      thickness ${r.resonance.thickness_um.toFixed(0)} µm</div>` : "");
+}
+
+// ---- wire up inputs ----
+["geometry","material","f0","bw","n_elem","aperture","elev_h","focus","tdepth","tsize"]
+  .forEach(id=>$(id).addEventListener("change",()=>compute(false)));
+$("steer").addEventListener("input",e=>{$("steerVal").textContent=e.target.value+"°";});
+$("steer").addEventListener("change",()=>compute(false));
+$("mSimple").onclick=()=>{mode="simple";$("mSimple").classList.add("on");$("mExpert").classList.remove("on");compute(true);};
+$("mExpert").onclick=()=>{mode="expert";$("mExpert").classList.add("on");$("mSimple").classList.remove("on");compute(true);};
+$("limits").innerHTML = "Linear acoustics only — no harmonic/nonlinear (THI), "+
+  "single scattering, homogeneous c=1540 m/s. Lateral FWHM is two-way (pulse-echo).";
+
+// keep plots fitted to their cards when the window resizes
+let rz=null;
+window.addEventListener("resize",()=>{
+  clearTimeout(rz);
+  rz=setTimeout(()=>{
+    ["pXZ","pYZ","pPSF","pBVD","pBMODE"].forEach(id=>{
+      const el=$(id); if(el && el.data) Plotly.Plots.resize(el);
+    });
+  },150);
+});
+
+boot();
+</script>
+</body>
+</html>
