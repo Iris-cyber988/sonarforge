@@ -6,8 +6,7 @@
 <title>SonarForge AI — Accessible Ultrasound Simulation</title>
 <script src="https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
-<script type="text/python" id="core-src">
-"""
+<script type="text/python" id="core-src">"""
 sonarforge_core.py
 ==================
 Stack-agnostic physics engine for the SonarForge AI ultrasound field explorer.
@@ -34,9 +33,22 @@ ATTEN_DB_CM_MHZ = 0.5      # dB/cm/MHz power-law attenuation (soft tissue)
 
 # ---- piezo material library (thickness-mode sound speed, coupling, eps_r) ----
 MATERIALS = {
-    "PZT-5H":       dict(ct=4000.0, kt=0.50, eps_r=3400, rho=7500),
-    "PMN-PT":       dict(ct=4600.0, kt=0.58, eps_r=5000, rho=8100),
-    "Piezocomposite": dict(ct=3200.0, kt=0.62, eps_r=1200, rho=3500),
+    # Qm = mechanical quality factor (sets BVD motional resistance R1 and the
+    # electrical -6 dB bandwidth). Soft PZT is moderately damped; single-crystal
+    # PMN-PT is higher-Q; 1-3 piezocomposite is heavily polymer-damped -> low Qm
+    # (this low Qm is exactly why composites give broad bandwidth).
+    "PZT-5H":       dict(ct=4000.0, kt=0.50, eps_r=3400, rho=7500, Qm=65.0),
+    "PMN-PT":       dict(ct=4600.0, kt=0.58, eps_r=5000, rho=8100, Qm=80.0),
+    "Piezocomposite": dict(ct=3200.0, kt=0.62, eps_r=1200, rho=3500, Qm=15.0),
+    # High-Qm "hard" PZT -- low loss, narrow band: high-power / therapy / CW Doppler.
+    "PZT-4":        dict(ct=4600.0, kt=0.51, eps_r=1300, rho=7500, Qm=500.0),
+    "PZT-8":        dict(ct=4600.0, kt=0.48, eps_r=1000, rho=7600, Qm=1000.0),
+    # PVDF -- piezo polymer: very low Z (~4 MRayl, near tissue) + broadband,
+    # low kt. High-frequency hydrophones / thin conformable sensors.
+    "PVDF":         dict(ct=2200.0, kt=0.20, eps_r=10,   rho=1780, Qm=10.0),
+    # Lithium niobate single crystal (36 deg Y-cut) -- very high Qm, very low
+    # eps_r (-> tiny C0), used at high frequency and in HIFU.
+    "LiNbO3":       dict(ct=7340.0, kt=0.49, eps_r=39,   rho=4640, Qm=10000.0),
 }
 
 GEOMETRIES = ("linear", "phased", "convex")
@@ -56,6 +68,15 @@ class Transducer:
     roc: float = None                 # radius of curvature (convex) [m]
     thickness: float = None           # piezo thickness [m]; if None -> from f0
     c: float = C_TISSUE               # medium sound speed [m/s]
+    apod: str = "rectangular"         # aperture apodization window (P3)
+    layout: str = "uniform"           # element layout: uniform|sparse|jitter (P6)
+    layout_seed: int = 1              # RNG seed for the jitter layout
+    # --- geometry-specific parameters (v13) ---
+    n_ring: int = 8                   # annular: number of concentric rings
+    nx: int = 32                      # matrix: element count in azimuth (x)
+    ny: int = 32                      # matrix: element count in elevation (y)
+    pitch_x: float = None             # matrix: azimuth pitch [m]; if None -> lambda
+    pitch_y: float = None             # matrix: elevation pitch [m]; if None -> lambda
 
     def resolve(self) -> "Transducer":
         """Fill derived / defaulted geometry so downstream code sees a full spec."""
@@ -80,8 +101,21 @@ class Transducer:
 def resolution_estimates(t: Transducer) -> dict:
     t = t.resolve()
     lam = t.wavelength
-    fnum_lat = t.focus / t.aperture
-    fnum_elev = t.focus / t.elev_h
+    if t.geometry in ("annular", "single"):
+        # radially symmetric full aperture: elevation == lateral resolution,
+        # both set by the circular aperture diameter (fixed/depth focus).
+        fnum_lat = t.focus / t.aperture
+        fnum_elev = t.focus / t.aperture
+    elif t.geometry == "matrix":
+        # real 2-D aperture: azimuth over nx*pitch_x, elevation over ny*pitch_y.
+        px = t.pitch_x if t.pitch_x else lam
+        py = t.pitch_y if t.pitch_y else lam
+        ap_x = max(t.nx * px, 1e-9); ap_y = max(t.ny * py, 1e-9)
+        fnum_lat = t.focus / ap_x
+        fnum_elev = t.focus / ap_y
+    else:
+        fnum_lat = t.focus / t.aperture
+        fnum_elev = t.focus / t.elev_h
     return dict(
         wavelength_mm=lam * 1e3,
         fnum_lateral=fnum_lat,
@@ -108,38 +142,157 @@ def resonance(t: Transducer) -> dict:
                 thickness_um=t.thickness * 1e6, kt=kt)
 
 
-def bvd_impedance(t: Transducer, freqs=None) -> dict:
-    """Butterworth-Van Dyke equivalent-circuit electrical impedance."""
+def bvd_impedance(t: Transducer, freqs=None, scope="element") -> dict:
+    """Butterworth-Van Dyke equivalent-circuit electrical impedance.
+
+    scope="element": one array element (area = pitch x elev_h) -- the standard
+        single-resonator BVD model.
+    scope="array":   all n_elem elements electrically in parallel
+        (area = aperture x elev_h); |Z| is ~1/n_elem of the single element.
+
+    The motional resistance is derived from the material mechanical quality
+    factor:  R1 = sqrt(L1/C1) / Qm  =  1 / (wr * C1 * Qm).
+    """
     t = t.resolve()
     mat = MATERIALS[t.material]
+    Qm = mat.get("Qm", 50.0)
     r = resonance(t)
     fr, fa = r["f_resonance_hz"], r["f_antires_hz"]
     if freqs is None:
         freqs = np.linspace(0.4 * t.f0, 1.6 * t.f0, 600)
     w = 2 * np.pi * freqs
-    # static (clamped) capacitance from geometry
-    area = t.aperture * t.elev_h
+    # clamped (static) capacitance from geometry; choose active electrode area
+    lam = t.wavelength
+    if t.geometry == "single":
+        # one filled circular piston: element == array (single channel).
+        full = np.pi * (t.aperture / 2.0) ** 2
+        area_arr = full
+        area_el = full
+    elif t.geometry == "annular":
+        nring = float(min(max(t.n_ring, 2), 24))
+        full = np.pi * (t.aperture / 2.0) ** 2       # filled disc
+        area_arr = full
+        area_el = full / nring                       # mean ring area
+    elif t.geometry == "matrix":
+        px = t.pitch_x if t.pitch_x else lam
+        py = t.pitch_y if t.pitch_y else lam
+        area_arr = (t.nx * px) * (t.ny * py)          # nx x ny filled 2-D aperture
+        area_el = px * py                             # one 2-D element
+    else:
+        area_arr = t.aperture * t.elev_h
+        area_el = t.pitch * t.elev_h                  # single element
+    if scope == "array":
+        area = area_arr
+    else:
+        area = area_el
     C0 = 8.854e-12 * mat["eps_r"] * area / t.thickness
     wr, wa = 2 * np.pi * fr, 2 * np.pi * fa
     C1 = C0 * (wa**2 / wr**2 - 1)
     L1 = 1.0 / (wr**2 * C1)
-    R1 = np.sqrt(L1 / C1) / 25.0            # motional resistance (Q~25)
+    R1 = np.sqrt(L1 / C1) / Qm              # motional resistance from Qm
     Zm = R1 + 1j * (w * L1 - 1.0 / (w * C1))
     Zc = 1.0 / (1j * w * C0)
     Z = (Zm * Zc) / (Zm + Zc)
     return dict(freqs_hz=freqs, Z_real=Z.real, Z_imag=Z.imag,
-                mag=np.abs(Z), C0_pf=C0 * 1e12)
+                mag=np.abs(Z), C0_pf=C0 * 1e12, scope=scope, Qm=Qm,
+                R1_ohm=float(R1), L1_uH=float(L1 * 1e6), C1_pf=float(C1 * 1e12))
 
 
 # ----------------------------------------------------------------------------
 #  3. Rayleigh-Sommerfeld coherent field (the beam maps)
 # ----------------------------------------------------------------------------
-def _sources(t: Transducer, n_sub_x=4, n_sub_y=9):
-    """Point-source cloud approximating the (possibly curved) aperture."""
+def _elements(t: Transducer):
+    """Element lateral centers + per-element amplitude (apodization x active).
+
+    Layout (P6):
+      uniform : n_elem on a regular grid, all active.
+      sparse  : every 2nd element switched off (periodic thinning) -> the active
+                pitch doubles, so grating lobes appear at half the steer angle.
+      jitter  : each element randomly perturbed by up to +-0.4 pitch -> the
+                periodicity is broken, so grating-lobe energy is spread into a
+                raised but diffuse sidelobe floor instead of a discrete lobe.
+    """
     t = t.resolve()
-    el = (np.arange(t.n_elem) - (t.n_elem - 1) / 2) * t.pitch
-    xs, ys, zs = [], [], []
-    for xc in el:
+    n = t.n_elem
+    el = (np.arange(n) - (n - 1) / 2) * t.pitch
+    active = np.ones(n)
+    layout = (t.layout or "uniform").lower()
+    if layout == "sparse":
+        active[1::2] = 0.0                         # periodic thinning
+    elif layout == "jitter":
+        rng = np.random.default_rng(t.layout_seed)
+        el = el + (rng.random(n) - 0.5) * 0.8 * t.pitch
+    win = _apod_window(n, t.apod)
+    amp_elem = win * active
+    return el, amp_elem
+
+
+def _source_cloud(t: Transducer, n_sub_x=4, n_sub_y=9):
+    """Point-source cloud + per-source amplitude -- the single source of truth.
+
+    Geometry:
+      single          : one filled circular piston (diameter = aperture),
+                        mechanically focused -- one channel, NO electronic
+                        beamforming (fixed focus, mechanical scan).
+      linear / phased : 1-D lateral line; elevation from lens sub-points
+                        (planar aperture, mechanical elevation lens).
+      convex          : the same line wrapped onto a cylinder of radius roc.
+      annular         : n_ring concentric equal-area rings -- radially
+                        symmetric 2-D aperture. Depth (on-axis) focus only;
+                        NO electronic steer (all elements share a radial delay).
+      matrix          : full nx x ny 2-D grid at (pitch_x, pitch_y) -- electronic
+                        focus AND steer in both azimuth and elevation (volumetric).
+    Returns (sx, sy, sz, amp) with amp aligned element-for-element.
+    """
+    t = t.resolve()
+    geo = t.geometry
+    lam = t.wavelength
+    if geo == "single":
+        # one filled circular piston: sample the disc on concentric rings at
+        # ~lambda/2 radial spacing, uniform amplitude, radial (fixed) focus.
+        R = t.aperture / 2.0
+        dr = lam                                     # lambda radial spacing (piston)
+        nring = int(max(3, round(R / dr)))
+        r_edge = np.linspace(0.0, R, nring + 1)
+        rc = 0.5 * (r_edge[:-1] + r_edge[1:])
+        xs, ys, zs, aa = [], [], [], []
+        for r in rc:
+            m = int(min(max(6, round(2 * np.pi * r / lam)), 160))
+            phi = np.linspace(0, 2 * np.pi, m, endpoint=False)
+            xs.append(r * np.cos(phi)); ys.append(r * np.sin(phi))
+            zs.append(np.zeros(m)); aa.append(np.ones(m))
+        return (np.concatenate(xs), np.concatenate(ys),
+                np.concatenate(zs), np.concatenate(aa))
+    if geo == "annular":
+        R = t.aperture / 2.0
+        nring = int(min(max(t.n_ring, 2), 24))
+        r_edge = R * np.sqrt(np.arange(nring + 1) / nring)   # equal-area rings
+        rc = 0.5 * (r_edge[:-1] + r_edge[1:])
+        win = _apod_window(nring, t.apod)
+        xs, ys, zs, aa = [], [], [], []
+        for r, ae in zip(rc, win):
+            m = int(min(max(8, round(2 * np.pi * r / (lam * 0.5))), 96))
+            phi = np.linspace(0, 2 * np.pi, m, endpoint=False)
+            xs.append(r * np.cos(phi)); ys.append(r * np.sin(phi))
+            zs.append(np.zeros(m)); aa.append(np.full(m, ae))
+        return (np.concatenate(xs), np.concatenate(ys),
+                np.concatenate(zs), np.concatenate(aa))
+    if geo == "matrix":
+        nx = int(min(max(t.nx, 2), 64)); ny = int(min(max(t.ny, 2), 64))
+        px = t.pitch_x if t.pitch_x else lam
+        py = t.pitch_y if t.pitch_y else lam
+        ex = (np.arange(nx) - (nx - 1) / 2) * px
+        ey = (np.arange(ny) - (ny - 1) / 2) * py
+        win_x = _apod_window(nx, t.apod)
+        win_y = _apod_window(ny, t.apod)
+        EX, EY = np.meshgrid(ex, ey)
+        AX, AY = np.meshgrid(win_x, win_y)
+        X = EX.ravel(); Y = EY.ravel(); Z = np.zeros(X.size)
+        return X, Y, Z, (AX * AY).ravel()
+    # linear / phased / convex : lens-sub-point line
+    el, amp_elem = _elements(t)
+    xs, ys, zs, aa = [], [], [], []
+    for xc, ae in zip(el, amp_elem):
         sx = xc + (np.arange(n_sub_x) - (n_sub_x - 1) / 2) * (t.pitch * 0.9 / n_sub_x)
         sy = (np.arange(n_sub_y) - (n_sub_y - 1) / 2) * (t.elev_h / n_sub_y)
         XX, YY = np.meshgrid(sx, sy)
@@ -151,7 +304,15 @@ def _sources(t: Transducer, n_sub_x=4, n_sub_y=9):
             X = t.roc * np.sin(ang)
             Z = t.roc * (1 - np.cos(ang))
         xs.append(X); ys.append(Y); zs.append(Z)
-    return np.concatenate(xs), np.concatenate(ys), np.concatenate(zs)
+        aa.append(np.full(X.size, ae))
+    return (np.concatenate(xs), np.concatenate(ys),
+            np.concatenate(zs), np.concatenate(aa))
+
+
+def _sources(t: Transducer, n_sub_x=4, n_sub_y=9):
+    """Point-source cloud approximating the aperture (see _source_cloud)."""
+    sx, sy, sz, _ = _source_cloud(t, n_sub_x, n_sub_y)
+    return sx, sy, sz
 
 
 def _focus_weights(sx, sy, sz, t: Transducer, steer_deg=0.0):
@@ -163,13 +324,74 @@ def _focus_weights(sx, sy, sz, t: Transducer, steer_deg=0.0):
     return np.exp(1j * k * r)          # delay-and-sum focusing phases
 
 
+# ---- P3: aperture apodization -------------------------------------------
+APOD_WINDOWS = ("rectangular", "hann", "hamming", "tukey")
+
+def _apod_window(n: int, kind: str = "rectangular") -> np.ndarray:
+    """Amplitude window over n elements (peak-normalised to 1)."""
+    kind = (kind or "rectangular").lower()
+    if n <= 1:
+        return np.ones(max(n, 1))
+    m = np.arange(n)
+    if kind in ("rectangular", "rect", "uniform", "none"):
+        return np.ones(n)
+    if kind in ("hann", "hanning"):
+        return 0.5 - 0.5 * np.cos(2 * np.pi * m / (n - 1))
+    if kind == "hamming":
+        return 0.54 - 0.46 * np.cos(2 * np.pi * m / (n - 1))
+    if kind == "tukey":
+        alpha = 0.5
+        w = np.ones(n)
+        edge = int(np.floor(alpha * (n - 1) / 2.0))
+        for i in range(edge + 1):
+            v = 0.5 * (1 + np.cos(np.pi * (2.0 * i / (alpha * (n - 1)) - 1)))
+            w[i] = v; w[n - 1 - i] = v
+        return w
+    return np.ones(n)
+
+# -6 dB main-lobe broadening relative to a uniform aperture (for the B-mode
+# convolution model, so all three outputs stay self-consistent).
+_APOD_BROADEN = {"rectangular": 1.00, "hann": 1.62, "hamming": 1.47, "tukey": 1.20}
+
+def _apod_amp(t: Transducer, n_sub_x=4, n_sub_y=9) -> np.ndarray:
+    """Per-source amplitude weights aligned to _sources() ordering.
+
+    Includes the P3 apodization window and the P6 layout active-mask, so a
+    thinned/sparse aperture correctly drops the switched-off elements.
+    Delegates to _source_cloud so annular/matrix geometries stay aligned.
+    """
+    _, _, _, amp = _source_cloud(t, n_sub_x, n_sub_y)
+    return amp
+
+
+# ---- P2: pulse bandwidth (frequency synthesis) ---------------------------
+def _freq_samples(t: Transducer, n_freq: int):
+    """Gaussian pulse spectrum sampled at n_freq frequencies.
+    Returns (freqs [Hz], power_weights) normalised to sum 1. n_freq<=1 -> CW."""
+    if n_freq <= 1 or t.bw <= 0:
+        return np.array([t.f0]), np.array([1.0])
+    sigma = t.bw * t.f0 / 2.3548          # -6 dB amplitude FWHM = bw*f0
+    span = 2.1 * sigma                     # cover to ~ -20 dB of the power spectrum
+    f = np.linspace(t.f0 - span, t.f0 + span, n_freq)
+    f = np.clip(f, 0.2 * t.f0, None)
+    wp = np.exp(-((f - t.f0) ** 2) / (sigma ** 2))   # |S(f)|^2 power weights
+    wp /= wp.sum()
+    return f, wp
+
+
 def field_map(t: Transducer, plane="xz", steer_deg=0.0,
-              extent=None, nx=200, nz=260):
-    """Return |p| field on a plane. plane in {'xz','yz'}."""
+              extent=None, nx=200, nz=260, n_freq=5, atten=True):
+    """Return field envelope on a plane. plane in {'xz','yz'}.
+
+    Broadband: incoherently sums |p(r; f_k)|^2 over a Gaussian pulse spectrum
+    (P2); each element amplitude is apodised by t.apod (P3). n_freq=1 -> CW.
+    atten=True applies frequency-dependent tissue attenuation exp(-alpha_k*R)
+    along every source->field path (P5), so the transmit beam decays with
+    depth exactly as in tissue (0.5 dB/cm/MHz).
+    """
     t = t.resolve()
-    k = 2 * np.pi / t.wavelength
     sx, sy, sz = _sources(t)
-    w = _focus_weights(sx, sy, sz, t, steer_deg)
+    amp = _apod_amp(t)
     if extent is None:
         half = max(t.aperture, t.elev_h)
         extent = (-1.2 * half, 1.2 * half, 0.2 * t.focus, 1.6 * t.focus)
@@ -181,51 +403,76 @@ def field_map(t: Transducer, plane="xz", steer_deg=0.0,
         PX, PY, PZ = A.ravel(), np.zeros(A.size), Z.ravel()
     else:  # yz
         PX, PY, PZ = np.zeros(A.size), A.ravel(), Z.ravel()
-    # chunk to bound memory (small blocks + float32 so this runs in Pyodide/WASM)
-    out = np.empty(PX.size)
+    # geometric focus distance per source (frequency-independent time delay)
+    if t.geometry in ("annular", "single"):
+        # radial symmetry: every source shares an on-axis focus law that
+        # depends only on its radius -> depth focus only, NO electronic steer.
+        rr = np.sqrt(sx ** 2 + sy ** 2)
+        rfoc = np.sqrt(rr ** 2 + t.focus ** 2)
+    else:
+        th = np.deg2rad(steer_deg)
+        fx = t.focus * np.sin(th); fz = t.focus * np.cos(th)
+        rfoc = np.sqrt((sx - fx) ** 2 + sy ** 2 + (sz - fz) ** 2)
     sx32 = sx.astype(np.float32); sy32 = sy.astype(np.float32); sz32 = sz.astype(np.float32)
-    wr = w.real.astype(np.float32); wi = w.imag.astype(np.float32)
-    k32 = np.float32(k)
+    rfoc32 = rfoc.astype(np.float32); amp32 = amp.astype(np.float32)
+    freqs, wpow = _freq_samples(t, n_freq)
+    # chunk to bound memory (small blocks + float32 so this runs in Pyodide/WASM)
+    powsum = np.zeros(PX.size)          # incoherent sum of |p(f_k)|^2
     B = 1024
-    for i in range(0, PX.size, B):
-        dx = PX[i:i+B, None].astype(np.float32) - sx32
-        dy = PY[i:i+B, None].astype(np.float32) - sy32
-        dz = PZ[i:i+B, None].astype(np.float32) - sz32
-        R = np.sqrt(dx*dx + dy*dy + dz*dz)
-        ph = k32 * R
-        cs = np.cos(ph); sn = np.sin(ph)
-        inv = 1.0 / R
-        # Re/Im of sum( w * exp(-j k R) / R )
-        re = np.sum((wr*cs + wi*sn) * inv, axis=1)
-        im = np.sum((wi*cs - wr*sn) * inv, axis=1)
-        out[i:i+B] = np.sqrt(re*re + im*im)
-    P = out.reshape(Z.shape)
+    for f_k, wp_k in zip(freqs, wpow):
+        k32 = np.float32(2 * np.pi * f_k / t.c)
+        # tissue attenuation coefficient at this frequency [Np/m] (P5)
+        a_np = np.float32(ATTEN_DB_CM_MHZ * (f_k/1e6) * 100.0 / 8.686) if atten else np.float32(0.0)
+        for i in range(0, PX.size, B):
+            dx = PX[i:i+B, None].astype(np.float32) - sx32
+            dy = PY[i:i+B, None].astype(np.float32) - sy32
+            dz = PZ[i:i+B, None].astype(np.float32) - sz32
+            R = np.sqrt(dx*dx + dy*dy + dz*dz)
+            # transmit delay-and-sum phase w = amp*exp(j k rfoc); field exp(-j k R)
+            ph = k32 * (rfoc32 - R)
+            inv = amp32 / R
+            if atten:
+                inv = inv * np.exp(-a_np * R)     # per-path tissue absorption
+            re = np.sum(np.cos(ph) * inv, axis=1)
+            im = np.sum(np.sin(ph) * inv, axis=1)
+            powsum[i:i+B] += wp_k * (re*re + im*im)
+    P = np.sqrt(powsum).reshape(Z.shape)
     P /= P.max()
     return dict(field=P, extent=(a0*1e3, a1*1e3, z1*1e3, z0*1e3),
                 plane=plane, axis_mm=ag*1e3, depth_mm=zg*1e3)
 
 
-def psf_lateral(t: Transducer, depth=None, steer_deg=0.0, n=801, half_mm=6.0):
+def psf_lateral(t: Transducer, depth=None, steer_deg=0.0, n=801, half_mm=6.0,
+                n_freq=5):
     t = t.resolve()
     if depth is None:
         depth = t.focus
-    k = 2 * np.pi / t.wavelength
     sx, sy, sz = _sources(t)
-    w = _focus_weights(sx, sy, sz, t, steer_deg)
+    amp = _apod_amp(t)
     x = np.linspace(-half_mm*1e-3, half_mm*1e-3, n)
+    if t.geometry in ("annular", "single"):
+        rr = np.sqrt(sx ** 2 + sy ** 2)
+        rfoc = np.sqrt(rr ** 2 + t.focus ** 2)
+    else:
+        th = np.deg2rad(steer_deg)
+        fx = t.focus * np.sin(th); fz = t.focus * np.cos(th)
+        rfoc = np.sqrt((sx - fx) ** 2 + sy ** 2 + (sz - fz) ** 2)
     sx32 = sx.astype(np.float32); sy32 = sy.astype(np.float32); sz32 = sz.astype(np.float32)
-    wr = w.real.astype(np.float32); wi = w.imag.astype(np.float32)
-    k32 = np.float32(k)
-    p = np.empty(n)
+    rfoc32 = rfoc.astype(np.float32); amp32 = amp.astype(np.float32)
+    freqs, wpow = _freq_samples(t, n_freq)
+    powsum = np.zeros(n)
     B = 256
-    for i in range(0, n, B):
-        dx = x[i:i+B, None].astype(np.float32) - sx32
-        dz = np.float32(depth) - sz32
-        R = np.sqrt(dx*dx + sy32*sy32 + dz*dz)
-        ph = k32 * R; cs = np.cos(ph); sn = np.sin(ph); inv = 1.0/R
-        re = np.sum((wr*cs + wi*sn) * inv, axis=1)
-        im = np.sum((wi*cs - wr*sn) * inv, axis=1)
-        p[i:i+B] = np.sqrt(re*re + im*im)
+    for f_k, wp_k in zip(freqs, wpow):
+        k32 = np.float32(2 * np.pi * f_k / t.c)
+        for i in range(0, n, B):
+            dx = x[i:i+B, None].astype(np.float32) - sx32
+            dz = np.float32(depth) - sz32
+            R = np.sqrt(dx*dx + sy32*sy32 + dz*dz)
+            ph = k32 * (rfoc32 - R); inv = amp32 / R
+            re = np.sum(np.cos(ph) * inv, axis=1)
+            im = np.sum(np.sin(ph) * inv, axis=1)
+            powsum[i:i+B] += wp_k * (re*re + im*im)
+    p = np.sqrt(powsum)
     p /= p.max()
     half = p >= 0.5
     fwhm_mm = (x[half][-1] - x[half][0]) * 1e3 if half.any() else np.nan
@@ -266,8 +513,23 @@ def bmode_phantom(t: Transducer, depth_span=(20e-3, 80e-3), width=40e-3,
     ax_sig = (res["axial_fwhm_mm"]/2.355)/dz_mm
     Fz = t.focus
     Fnum = Fz / t.aperture
-    w0 = 0.886 * t.wavelength * Fnum          # focal lateral FWHM [m]
+    broaden = _APOD_BROADEN.get((t.apod or "rectangular").lower(), 1.0)
+    w0 = 0.886 * t.wavelength * Fnum * broaden  # focal lateral FWHM [m], apod-widened
     zR = 3.55 * t.wavelength * Fnum**2         # Rayleigh range [m]
+    # --- grating-lobe geometry ---------------------------------------------
+    # An undersampled array (pitch > lambda/2) radiates grating lobes at
+    #   sin(theta_g) = lambda / pitch,
+    # so each true target casts mirrored ghost copies laterally displaced by
+    #   dx(z) = z * tan(theta_g).
+    # The ghost brightness is the element-directivity (element factor) evaluated
+    # at theta_g: sinc(w/pitch), with w ~ 0.9*pitch a filled element (10% kerf).
+    # A fully sampled array (pitch <= lambda) has no propagating grating lobe.
+    sg = t.wavelength / t.pitch
+    has_gl = sg < 1.0
+    if has_gl:
+        theta_g = np.arcsin(sg)
+        gl_fill = 0.9                       # element width / pitch
+        gl_amp = abs(np.sinc(gl_fill))      # ~0.11 (-19 dB) for a filled element
     img = np.zeros_like(refl)
     for i in range(nz):
         lat_fwhm = w0 * np.sqrt(1.0 + ((z[i]-Fz)/zR)**2) * 1e3   # mm
@@ -276,7 +538,15 @@ def bmode_phantom(t: Transducer, depth_span=(20e-3, 80e-3), width=40e-3,
         # wide out-of-focus beam is not truncated (>=3 sigma, capped for cost).
         kh = int(min(80, max(15, np.ceil(3*lat_sig))))
         kx = np.exp(-0.5*((np.arange(-kh,kh+1))/lat_sig)**2); kx/=kx.sum()
-        img[i] = np.convolve(refl[i], kx, mode="same")
+        row = np.convolve(refl[i], kx, mode="same")
+        if has_gl:
+            gpix = int(round((z[i]*np.tan(theta_g)*1e3)/dx_mm))
+            if 0 < gpix < nx:
+                ghost = np.zeros_like(row)
+                ghost[gpix:] += row[:-gpix]   # +theta_g copy
+                ghost[:-gpix] += row[gpix:]   # -theta_g copy
+                row = row + gl_amp*ghost
+        img[i] = row
     # axial blur
     kz = np.exp(-0.5*((np.arange(-15,16))/ax_sig)**2); kz/=kz.sum()
     for j in range(nx):
@@ -289,7 +559,16 @@ def bmode_phantom(t: Transducer, depth_span=(20e-3, 80e-3), width=40e-3,
     log = 20*np.log10(env + 1e-4)
     dr = 50.0
     disp = np.clip((log + dr)/dr, 0, 1)
-    return dict(image=disp, x_mm=x*1e3, z_mm=z*1e3)
+    # grating-lobe report for the UI: angle, ghost offset at the focal depth,
+    # and whether any ghost copy actually lands inside the +/-width/2 field.
+    if has_gl:
+        gl_deg = float(np.degrees(theta_g))
+        ghost_mm = float(Fz*np.tan(theta_g)*1e3)
+        visible = bool(abs(ghost_mm) < (width/2*1e3))
+    else:
+        gl_deg = None; ghost_mm = None; visible = False
+    return dict(image=disp, x_mm=x*1e3, z_mm=z*1e3,
+                gl_deg=gl_deg, gl_ghost_mm=ghost_mm, gl_visible=visible)
 
 
 # ----------------------------------------------------------------------------
@@ -352,7 +631,6 @@ def full_report(t: Transducer, target_depth=None, target_size=None) -> dict:
                 resolution=resolution_estimates(t),
                 resonance=resonance(t),
                 advisor=design_advisor(t, target_depth, target_size))
-
 </script>
 <style>
   :root{--bg:#0d1117;--panel:#161b22;--edge:#30363d;--txt:#e6edf3;--muted:#8b949e;
@@ -375,6 +653,10 @@ def full_report(t: Transducer, target_depth=None, target_size=None) -> dict:
   .fld input,.fld select{width:100%;background:#0d1117;color:var(--txt);
         border:1px solid var(--edge);border-radius:6px;padding:5px 7px;font-size:13px}
   .row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .expert-only{display:none}
+  body.expert .expert-only{display:block}
+  [data-geo]{display:none}
+  #pitchInfo,#singleInfo,#annInfo,#matrixInfo{font-size:11.5px;margin:-2px 0 9px;line-height:1.3}
   .main{overflow:auto;padding:16px 18px}
   .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}
   .card{background:var(--panel);border:1px solid var(--edge);border-radius:10px;
@@ -384,12 +666,17 @@ def full_report(t: Transducer, target_depth=None, target_size=None) -> dict:
   .card .u{font-size:12px;color:var(--muted)}
   .card.ok{border-color:#238636}.card.bad{border-color:#8b2a25}
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-  .plot{background:var(--panel);border:1px solid var(--edge);border-radius:10px;
-        padding:8px;height:42vh;min-height:320px}
+  .panel{background:var(--panel);border:1px solid var(--edge);border-radius:10px;
+         padding:8px;display:flex;flex-direction:column}
+  .plot{height:42vh;min-height:320px}
   .plot .js-plotly-plot,.plot .plot-container{width:100%!important;height:100%!important}
   #pBMODE{height:46vh;min-height:360px}
+  .cap{margin-top:8px;padding-top:8px;border-top:1px solid var(--edge)}
+  .cap .method{font-size:11px;color:var(--muted);line-height:1.4}
+  .cap .reading{font-size:12.5px;color:var(--txt);line-height:1.45;margin-top:6px}
+  .cap .reading b{color:var(--accent);font-weight:600}
   .advisor{background:var(--panel);border:1px solid var(--edge);border-radius:10px;
-           padding:12px 16px;margin-top:14px;font-size:13px}
+           padding:12px 16px;font-size:13px;overflow:auto}
   .advisor .warn{color:var(--warn)} .advisor .note{color:var(--muted)}
   .modebar{display:flex;gap:6px;margin-bottom:8px}
   .modebar button{flex:1;background:#0d1117;border:1px solid var(--edge);color:var(--txt);
@@ -420,32 +707,82 @@ def full_report(t: Transducer, target_depth=None, target_size=None) -> dict:
     <h2>Geometry</h2>
     <div class="fld"><label>Array type</label>
       <select id="geometry">
+        <option value="single" class="geo-expert">Single element</option>
         <option value="linear">Linear</option>
-        <option value="phased">Phased</option>
+        <option value="annular" class="geo-expert">Annular</option>
         <option value="convex">Convex</option>
+        <option value="matrix" class="geo-expert">2D Matrix</option>
       </select></div>
-    <div class="row2">
-      <div class="fld"><label>Elements</label><input id="n_elem" type="number" value="64" min="8" max="256"></div>
-      <div class="fld"><label>Aperture (mm)</label><input id="aperture" type="number" value="26" step="1"></div>
+
+    <!-- linear / convex: element count + total aperture -->
+    <div data-geo="linear convex">
+      <div class="row2">
+        <div class="fld"><label>Elements</label><input id="n_elem" type="number" value="64" min="32" max="192"></div>
+        <div class="fld"><label>Aperture (mm)</label><input id="aperture" type="number" value="26" step="1" min="10" max="48"></div>
+      </div>
+      <div id="pitchInfo"></div>
+      <div class="fld expert-only"><label>Elev. height (mm)</label><input id="elev_h" type="number" value="5" step="0.5"></div>
     </div>
-    <div class="row2">
-      <div class="fld"><label>Elev. height (mm)</label><input id="elev_h" type="number" value="5" step="0.5"></div>
-      <div class="fld"><label>Focus (mm)</label><input id="focus" type="number" value="50" step="1"></div>
+
+    <!-- single element: one filled circular piston -->
+    <div data-geo="single">
+      <div class="fld"><label>Diameter (mm)</label><input id="diameter" type="number" value="13" step="1" min="5" max="30"></div>
+      <div id="singleInfo"></div>
     </div>
+
+    <!-- annular: concentric equal-area rings -->
+    <div data-geo="annular">
+      <div class="row2">
+        <div class="fld"><label>Diameter (mm)</label><input id="ann_diam" type="number" value="19" step="1" min="8" max="40"></div>
+        <div class="fld"><label>Rings</label><input id="n_ring" type="number" value="8" step="1" min="4" max="16"></div>
+      </div>
+      <div id="annInfo"></div>
+    </div>
+
+    <!-- 2D matrix: nx x ny grid, independent pitch in x and y -->
+    <div data-geo="matrix">
+      <div class="row2">
+        <div class="fld"><label>Nx (azimuth)</label><input id="nx" type="number" value="32" step="1" min="8" max="64"></div>
+        <div class="fld"><label>Ny (elevation)</label><input id="ny" type="number" value="32" step="1" min="8" max="64"></div>
+      </div>
+      <div class="row2">
+        <div class="fld"><label>Pitch x (mm)</label><input id="pitch_x" type="number" value="0.30" step="0.01" min="0.1" max="0.6"></div>
+        <div class="fld"><label>Pitch y (mm)</label><input id="pitch_y" type="number" value="0.30" step="0.01" min="0.1" max="0.6"></div>
+      </div>
+      <div id="matrixInfo"></div>
+    </div>
+
+    <div class="fld"><label>Focus (mm)</label><input id="focus" type="number" value="50" step="1"></div>
 
     <h2>Excitation</h2>
-    <div class="row2">
-      <div class="fld"><label>f0 (MHz)</label><input id="f0" type="number" value="5" step="0.5"></div>
-      <div class="fld"><label>Bandwidth</label><input id="bw" type="number" value="0.6" step="0.05"></div>
-    </div>
-    <div class="fld"><label>Steering angle (°)</label>
+    <div class="fld"><label>f0 (MHz)</label><input id="f0" type="number" value="5" step="0.5"></div>
+    <div class="fld expert-only"><label>Bandwidth</label><input id="bw" type="number" value="0.6" step="0.05"></div>
+    <div class="fld expert-only"><label>Steering angle (°)</label>
       <input id="steer" type="range" min="-30" max="30" value="0" step="1">
       <span id="steerVal" class="u">0°</span></div>
+    <div class="fld expert-only"><label>Apodization (aperture window)</label>
+      <select id="apod">
+        <option value="rectangular">Rectangular (uniform, −13 dB)</option>
+        <option value="hann">Hann (−31 dB, wider main lobe)</option>
+        <option value="hamming">Hamming (−42 dB)</option>
+        <option value="tukey">Tukey α=0.5 (intermediate)</option>
+      </select></div>
+    <div class="fld expert-only"><label>Array layout (element positions)</label>
+      <select id="layout">
+        <option value="uniform">Uniform (all elements, clean)</option>
+        <option value="sparse">Sparse (every 2nd off → grating lobe)</option>
+        <option value="jitter">Jitter (random ±0.4·pitch → diffuse)</option>
+      </select></div>
 
-    <h2>Material</h2>
-    <div class="fld"><label>Piezo</label>
+    <h2 class="expert-only">Material</h2>
+    <div class="fld expert-only"><label>Piezo</label>
       <select id="material">
-        <option>PZT-5H</option><option>PMN-PT</option><option>Piezocomposite</option>
+        <option>PZT-5H</option><option>PMN-PT</option><option>PZT-4</option><option>PZT-8</option><option>PVDF</option><option>LiNbO3</option><option>Piezocomposite</option>
+      </select></div>
+    <div class="fld expert-only"><label>BVD impedance scope</label>
+      <select id="bvdscope">
+        <option value="element">Per channel</option>
+        <option value="array">All channels (∥)</option>
       </select></div>
 
     <h2>Imaging target</h2>
@@ -461,13 +798,43 @@ def full_report(t: Transducer, target_depth=None, target_size=None) -> dict:
   <main class="main">
     <div class="cards" id="cards"></div>
     <div class="grid">
-      <div class="plot" id="pXZ"></div>
-      <div class="plot" id="pYZ"></div>
-      <div class="plot" id="pPSF"></div>
-      <div class="plot" id="pBVD"></div>
-      <div class="plot" id="pBMODE" style="grid-column:1/3"></div>
+      <div class="panel">
+        <div class="plot" id="pXZ"></div>
+        <div class="cap">
+          <div class="method">Coherent Rayleigh–Sommerfeld summation over discretized aperture sources, multi-frequency averaged. Homogeneous tissue, c = 1540 m/s, 0.5 dB/cm/MHz attenuation.</div>
+          <div class="reading" id="rdXZ"></div>
+        </div>
+      </div>
+      <div class="panel expert-only">
+        <div class="plot" id="pYZ"></div>
+        <div class="cap">
+          <div class="method">Elevation plane. Focus comes from a fixed acoustic lens (rectangular aperture) — a 1-D array has no electronic control here, so this plane is always softer than x–z.</div>
+          <div class="reading" id="rdYZ"></div>
+        </div>
+      </div>
+      <div class="panel expert-only">
+        <div class="plot" id="pPSF"></div>
+        <div class="cap">
+          <div class="method">One-way transmit lateral beam profile near the focal depth; FWHM read at −6 dB. The steered trace exposes grating lobes when element pitch exceeds λ/2.</div>
+          <div class="reading" id="rdPSF"></div>
+        </div>
+      </div>
+      <div class="panel expert-only">
+        <div class="plot" id="pBVD"></div>
+        <div class="cap">
+          <div class="method">Butterworth–Van Dyke lumped-element model (thickness mode). Grey/red dotted lines mark resonance f<sub>r</sub> and anti-resonance f<sub>a</sub>; the R₁/Q<sub>m</sub> ratio sets bandwidth. The dashed amber line is the 50 Ω system reference — distance from it shows how much electrical matching a drive channel needs. Only C₀ (∝ electrode area) changes with geometry; f<sub>r</sub>, f<sub>a</sub> and R₁ are set by thickness and material.</div>
+          <div class="reading" id="rdBVD"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="plot" id="pBMODE"></div>
+        <div class="cap">
+          <div class="method">Fixed reflectivity map (wire points + anechoic cyst + speckle) convolved with a depth-dependent lateral PSF of width w₀ = 0.886·λ·F#. Sharpness is set by f0, aperture, focus and apodisation (via λ and F#). If the array is undersampled (pitch > λ/2) each target also casts mirrored grating-lobe ghosts at ±z·tan(θg), suppressed to the element-factor level (~−19 dB); lowering element count over a fixed aperture makes them visible. Material and elevation do not enter this plane. A resolvability demo, not a scattering simulation.</div>
+          <div class="reading" id="rdBM"></div>
+        </div>
+      </div>
+      <div class="advisor" id="advisor"></div>
     </div>
-    <div class="advisor" id="advisor"></div>
   </main>
 </div>
 
@@ -510,6 +877,8 @@ async function boot(){
     ready = true;
     status.textContent = "ready";
     status.style.color = "var(--ok)";
+    syncGeoPanel();
+    updatePitch();
     compute(true);
   }catch(e){
     fail("Startup failed:\n" + (e && e.message ? e.message : String(e)));
@@ -517,16 +886,33 @@ async function boot(){
 }
 
 function specFromUI(){
+  const expert = (mode==="expert");
+  const geo = $("geometry").value;
+  // Each geometry maps its own controls onto the core Transducer fields.
+  // aperture doubles as "diameter" for single/annular (circular apertures).
+  let n_elem = parseInt($("n_elem").value);
+  let aperture = parseFloat($("aperture").value)*1e-3;
+  if(geo==="single"){ aperture = parseFloat($("diameter").value)*1e-3; }
+  else if(geo==="annular"){ aperture = parseFloat($("ann_diam").value)*1e-3; }
   return {
-    geometry: $("geometry").value,
-    material: $("material").value,
+    expert, geometry: geo,
+    // Expert-only knobs are locked to safe defaults in Simple mode so a
+    // beginner never sees sidelobe/grating-lobe/equivalent-circuit effects.
+    material: expert ? $("material").value : "PZT-5H",
+    apod:     expert ? $("apod").value     : "rectangular",
+    layout:   expert ? $("layout").value   : "uniform",
+    bvdscope: expert ? $("bvdscope").value : "element",
+    bw:       expert ? parseFloat($("bw").value) : 0.6,
+    steer:    expert ? parseFloat($("steer").value) : 0,
+    elev_h:   (expert ? parseFloat($("elev_h").value) : 5)*1e-3,
     f0: parseFloat($("f0").value)*1e6,
-    bw: parseFloat($("bw").value),
-    n_elem: parseInt($("n_elem").value),
-    aperture: parseFloat($("aperture").value)*1e-3,
-    elev_h: parseFloat($("elev_h").value)*1e-3,
+    n_elem, aperture,
+    n_ring:  parseInt($("n_ring").value),
+    nx:      parseInt($("nx").value),
+    ny:      parseInt($("ny").value),
+    pitch_x: parseFloat($("pitch_x").value)*1e-3,
+    pitch_y: parseFloat($("pitch_y").value)*1e-3,
     focus: parseFloat($("focus").value)*1e-3,
-    steer: parseFloat($("steer").value),
     tdepth: parseFloat($("tdepth").value)*1e-3,
     tsize: parseFloat($("tsize").value)*1e-3,
   };
@@ -537,14 +923,13 @@ function runPython(s, nx, nz){
   const code = `
 import json, numpy as np, sonarforge_core as sf
 t = sf.Transducer(geometry=${JSON.stringify(s.geometry)}, material=${JSON.stringify(s.material)},
+                  apod=${JSON.stringify(s.apod)}, layout=${JSON.stringify(s.layout)},
                   f0=${s.f0}, bw=${s.bw}, n_elem=${s.n_elem}, aperture=${s.aperture},
-                  elev_h=${s.elev_h}, focus=${s.focus}).resolve()
+                  elev_h=${s.elev_h}, focus=${s.focus},
+                  n_ring=${s.n_ring}, nx=${s.nx}, ny=${s.ny},
+                  pitch_x=${s.pitch_x}, pitch_y=${s.pitch_y}).resolve()
 rep = sf.full_report(t, target_depth=${s.tdepth}, target_size=${s.tsize})
-xz = sf.field_map(t, plane="xz", steer_deg=${s.steer}, nx=${nx}, nz=${nz})
-yz = sf.field_map(t, plane="yz", nx=${nx}, nz=${nz})
-psf = sf.psf_lateral(t, steer_deg=${s.steer})
-psf0= sf.psf_lateral(t, steer_deg=0)
-bvd = sf.bvd_impedance(t)
+xz = sf.field_map(t, plane="xz", steer_deg=${s.steer}, nx=${nx}, nz=${nz}, n_freq=3)
 bm  = sf.bmode_phantom(t, nz=${Math.min(nz,300)}, nx=${Math.min(nx,220)})
 def db(a): return (20*np.log10(np.asarray(a)+1e-3)).tolist()
 out = dict(
@@ -552,14 +937,22 @@ out = dict(
   resolution=rep["resolution"], resonance=rep["resonance"],
   notes=rep["advisor"]["notes"], warnings=rep["advisor"]["warnings"],
   xz=dict(z=db(xz["field"]), x=xz["axis_mm"].tolist(), y=xz["depth_mm"].tolist()),
-  yz=dict(z=db(yz["field"]), x=yz["axis_mm"].tolist(), y=yz["depth_mm"].tolist()),
-  psf=dict(x=psf["x_mm"].tolist(), p=psf["p_db"].tolist(), fwhm=float(psf["fwhm_mm"]),
-           x0=psf0["x_mm"].tolist(), p0=psf0["p_db"].tolist(), fwhm0=float(psf0["fwhm_mm"])),
-  bvd=dict(f=(bvd["freqs_hz"]/1e6).tolist(), mag=bvd["mag"].tolist(),
-           fr=rep["resonance"]["f_resonance_hz"]/1e6, fa=rep["resonance"]["f_antires_hz"]/1e6),
   bm=dict(img=bm["image"].tolist(), x=[float(bm["x_mm"][0]),float(bm["x_mm"][-1])],
-          z=[float(bm["z_mm"][0]),float(bm["z_mm"][-1])]),
+          z=[float(bm["z_mm"][0]),float(bm["z_mm"][-1])],
+          gl_deg=bm["gl_deg"], gl_ghost_mm=bm["gl_ghost_mm"], gl_visible=bm["gl_visible"]),
+  yz=None, psf=None, bvd=None,
 )
+if ${s.expert ? "True" : "False"}:
+    yz = sf.field_map(t, plane="yz", nx=${nx}, nz=${nz}, n_freq=1)
+    psf = sf.psf_lateral(t, steer_deg=${s.steer}, n_freq=5)
+    psf0= sf.psf_lateral(t, steer_deg=0, n_freq=5)
+    bvd = sf.bvd_impedance(t, scope=${JSON.stringify(s.bvdscope)})
+    out["yz"]=dict(z=db(yz["field"]), x=yz["axis_mm"].tolist(), y=yz["depth_mm"].tolist())
+    out["psf"]=dict(x=psf["x_mm"].tolist(), p=psf["p_db"].tolist(), fwhm=float(psf["fwhm_mm"]),
+           x0=psf0["x_mm"].tolist(), p0=psf0["p_db"].tolist(), fwhm0=float(psf0["fwhm_mm"]))
+    out["bvd"]=dict(f=(bvd["freqs_hz"]/1e6).tolist(), mag=bvd["mag"].tolist(),
+           fr=rep["resonance"]["f_resonance_hz"]/1e6, fa=rep["resonance"]["f_antires_hz"]/1e6,
+           scope=bvd["scope"], Qm=bvd["Qm"], R1=bvd["R1_ohm"], C0=bvd["C0_pf"])
 json.dumps(out)`;
   return JSON.parse(pyodide.runPython(code));
 }
@@ -604,26 +997,44 @@ function render(r,s){
 
   // ---- fields ----
   heat($("pXZ"), r.xz, "Acoustic field  x–z [dB]", "lateral x [mm]", "depth z [mm]");
-  heat($("pYZ"), r.yz, "Elevation field  y–z [dB]", "elev y [mm]", "depth z [mm]");
+  if(r.yz) heat($("pYZ"), r.yz, "Elevation field  y–z [dB]", "elev y [mm]", "depth z [mm]");
 
   // ---- PSF ----
-  Plotly.react($("pPSF"),[
+  if(r.psf) Plotly.react($("pPSF"),[
     {x:r.psf.x0,y:r.psf.p0,name:`on-axis ${r.psf.fwhm0.toFixed(2)}mm`,line:{color:"#2f81f7"}},
     {x:r.psf.x,y:r.psf.p,name:`steer ${s.steer}° ${r.psf.fwhm.toFixed(2)}mm`,line:{color:"#d29922"}},
-  ],{title:{text:"Lateral PSF",font:{size:13,color:"#e6edf3"}},
-     margin:{l:44,r:10,t:34,b:40},paper_bgcolor:"#161b22",plot_bgcolor:"#161b22",
-     font:{color:"#8b949e",size:11},yaxis:{range:[-50,2],title:"dB"},xaxis:{title:"x [mm]"},
-     legend:{font:{size:10}}},{displayModeBar:false,responsive:true});
+  ],{title:{text:"Lateral PSF",font:{size:13,color:"#e6edf3"}},autosize:true,
+     margin:{l:48,r:20,t:34,b:42},paper_bgcolor:"#161b22",plot_bgcolor:"#161b22",
+     font:{color:"#8b949e",size:11},
+     yaxis:{range:[-50,2],title:"dB",showgrid:true,gridcolor:"#484f58",griddash:"dot",gridwidth:1},
+     xaxis:{title:"x [mm]",zeroline:true,zerolinecolor:"#30363d",
+            showgrid:true,gridcolor:"#484f58",griddash:"dot",gridwidth:1},
+     legend:{x:0.02,xanchor:"left",y:0.02,yanchor:"bottom",font:{size:10},
+             bgcolor:"rgba(22,27,34,0.6)",bordercolor:"#30363d",borderwidth:1}},
+     {displayModeBar:false,responsive:true});
 
   // ---- BVD ----
+  if(r.bvd){
+  const _zmin=Math.min(...r.bvd.mag,50), _zmax=Math.max(...r.bvd.mag,50);
+  const _ylo=Math.floor(Math.log10(_zmin))-0.3, _yhi=Math.ceil(Math.log10(_zmax))+0.3;
   Plotly.react($("pBVD"),[{x:r.bvd.f,y:r.bvd.mag,line:{color:"#3fb950"}}],
-    {title:{text:"BVD electrical |Z|",font:{size:13,color:"#e6edf3"}},
+    {title:{text:`BVD |Z| — ${r.bvd.scope==="array"?"all channels ∥":"per channel"} (Qm=${r.bvd.Qm.toFixed(0)}, R₁=${r.bvd.R1.toFixed(0)}Ω, C₀=${r.bvd.C0.toFixed(0)}pF)`,font:{size:12,color:"#e6edf3"}},
      margin:{l:54,r:10,t:34,b:40},paper_bgcolor:"#161b22",plot_bgcolor:"#161b22",
-     font:{color:"#8b949e",size:11},yaxis:{type:"log",title:"|Z| Ω"},xaxis:{title:"MHz"},
+     font:{color:"#8b949e",size:11},
+     yaxis:{type:"log",title:"|Z| [Ω]",range:[_ylo,_yhi],dtick:1,tickformat:"~s",
+            showgrid:true,gridcolor:"#484f58",griddash:"dot",gridwidth:1,
+            minor:{showgrid:true,gridcolor:"#2d333b",griddash:"dot"}},
+     xaxis:{title:"MHz",showgrid:true,gridcolor:"#484f58",griddash:"dot",gridwidth:1},
      shapes:[{type:"line",x0:r.bvd.fr,x1:r.bvd.fr,y0:0,y1:1,yref:"paper",
               line:{color:"#8b949e",dash:"dot"}},
              {type:"line",x0:r.bvd.fa,x1:r.bvd.fa,y0:0,y1:1,yref:"paper",
-              line:{color:"#f85149",dash:"dot"}}]},{displayModeBar:false,responsive:true});
+              line:{color:"#f85149",dash:"dot"}},
+             {type:"line",x0:0,x1:1,xref:"paper",y0:50,y1:50,
+              line:{color:"#d29922",dash:"dash",width:1.5}}],
+     annotations:[{x:0.02,xref:"paper",y:50,yref:"y",text:"50 Ω system",
+              showarrow:false,xanchor:"left",yanchor:"bottom",
+              font:{size:9,color:"#d29922"}}]},{displayModeBar:false,responsive:true});
+  }
 
   // ---- B-mode ----
   const bmx=[r.bm.x[0],r.bm.x[1]], bmz=[r.bm.z[0],r.bm.z[1]];
@@ -636,6 +1047,68 @@ function render(r,s){
      font:{color:"#8b949e",size:11},yaxis:{autorange:"reversed",title:"depth z [mm]"},
      xaxis:{title:"lateral x [mm]"}},{displayModeBar:false,responsive:true});
 
+  // ---- dynamic readings (one plain-language conclusion per panel) ----
+  const focusMM = s.focus*1e3, tsizeMM = s.tsize*1e3;
+  $("rdXZ").innerHTML =
+    `Beam converges to a focus near <b>${focusMM.toFixed(0)} mm</b>; lateral resolution there `+
+    `is <b>${R.lateral_fwhm_mm.toFixed(2)} mm</b> (two-way) and axial <b>${R.axial_fwhm_mm.toFixed(2)} mm</b>. `+
+    `Above/below the focus the beam widens — that spread is the depth of field.`;
+  if(r.yz){
+    const ratio = (R.elevation_fwhm_mm / R.lateral_fwhm_mm);
+    $("rdYZ").innerHTML =
+      `Elevation FWHM <b>${R.elevation_fwhm_mm.toFixed(2)} mm</b> — about <b>${ratio.toFixed(0)}×</b> `+
+      `wider than lateral. The fixed lens (F# ${R.fnum_elevation.toFixed(1)}) focuses more weakly than the `+
+      `electronically-focused x–z plane, so slice thickness is the coarsest dimension.`;
+  }
+  if(r.psf){
+    const blown = r.psf.fwhm > 2.2*r.psf.fwhm0;
+    $("rdPSF").innerHTML =
+      `On-axis lateral FWHM <b>${r.psf.fwhm0.toFixed(2)} mm</b>. Steered to ${s.steer}°: `+
+      `<b>${r.psf.fwhm.toFixed(2)} mm</b>` +
+      (blown ? ` — grating lobes have broken up the beam; pitch exceeds λ/2, so this steer angle is unsafe.`
+             : ` — beam holds together at this steer angle.`);
+  }
+  if(r.bvd){
+    const broad = r.bvd.Qm <= 100;
+    // |Z| at the drive frequency f0, read off the plotted curve
+    const f0MHz = s.f0/1e6;
+    let bi=0, bd=1e9;
+    for(let i=0;i<r.bvd.f.length;i++){const d=Math.abs(r.bvd.f[i]-f0MHz); if(d<bd){bd=d;bi=i;}}
+    const Zf0 = r.bvd.mag[bi];
+    const ratio = Zf0/50;
+    const matchTxt = ratio>3 ? `<b>${ratio.toFixed(0)}× above 50 Ω</b> — badly mismatched, needs a matching network`
+                   : ratio<0.33 ? `<b>${(1/ratio).toFixed(0)}× below 50 Ω</b> — low impedance, over-damped into 50 Ω`
+                   : `<b>near 50 Ω</b> — reasonable match`;
+    const scopeTxt = s.geometry==="single"
+      ? ` Single-piston transducer: one channel = the whole aperture, so per-channel and all-channels are identical here.`
+      : r.bvd.scope==="array"
+      ? ` This "all channels ∥" curve is every element shorted together (single-element / CW mode) — <b>not</b> how a phased array is driven; in imaging each channel sees the per-channel value.`
+      : ` This is the per-channel impedance each pulser actually drives.`;
+    $("rdBVD").innerHTML =
+      `Resonance <b>${r.bvd.fr.toFixed(2)} MHz</b>, anti-resonance <b>${r.bvd.fa.toFixed(2)} MHz</b>. `+
+      `Q<sub>m</sub> ${r.bvd.Qm.toFixed(0)} → ${broad?"<b>broadband</b> (short pulse, good for imaging)":"<b>narrowband</b> (long ring-down, high-power/CW)"}; `+
+      `R₁ ${r.bvd.R1.toFixed(r.bvd.R1<100?1:0)} Ω, C₀ ${r.bvd.C0.toFixed(0)} pF. `+
+      `At f0 |Z| ≈ ${Zf0.toFixed(Zf0<100?1:0)} Ω, ${matchTxt}.`+
+      scopeTxt;
+  }
+  const resolvable = tsizeMM >= R.lateral_fwhm_mm;
+  let glTxt;
+  if(r.bm.gl_visible){
+    glTxt = ` Array is undersampled: grating lobes at ±${r.bm.gl_deg.toFixed(0)}° cast `+
+            `mirrored ghosts ±${Math.abs(r.bm.gl_ghost_mm).toFixed(0)} mm from each target — `+
+            `<b>visible in this frame</b>. Raise element count (shrink pitch toward λ/2) to remove them.`;
+  } else if(r.bm.gl_deg!==null){
+    glTxt = ` Grating lobes exist at ±${r.bm.gl_deg.toFixed(0)}° but their ghosts fall `+
+            `±${Math.abs(r.bm.gl_ghost_mm).toFixed(0)} mm outside the field — not seen here.`;
+  } else {
+    glTxt = ` Pitch ≤ λ/2, so no grating lobes.`;
+  }
+  $("rdBM").innerHTML =
+    `Target <b>${tsizeMM.toFixed(1)} mm</b> vs lateral FWHM <b>${R.lateral_fwhm_mm.toFixed(2)} mm</b> — `+
+    (resolvable ? `resolvable; wire targets appear as distinct points.`
+                : `near/below the resolution limit; targets blur together.`)+
+    glTxt;
+
   // ---- advisor ----
   const notes = r.notes.map(n=>`<div class="note">• ${n}</div>`).join("");
   const warns = r.warnings.map(w=>`<div class="warn">⚠ ${w}</div>`).join("");
@@ -644,15 +1117,93 @@ function render(r,s){
       F# lat ${R.fnum_lateral.toFixed(2)} · F# elev ${R.fnum_elevation.toFixed(1)} ·
       λ ${R.wavelength_mm.toFixed(3)} mm · elev FWHM ${R.elevation_fwhm_mm.toFixed(2)} mm ·
       thickness ${r.resonance.thickness_um.toFixed(0)} µm</div>` : "");
+
+  // Panels (esp. expert-only ones just un-hidden) may have been sized before
+  // their container reached full width, leaving the plot stuck to the left.
+  // Force every Plotly figure to refit its card once layout settles.
+  requestAnimationFrame(()=>{
+    ["pXZ","pYZ","pPSF","pBVD","pBMODE"].forEach(id=>{
+      const el=$(id); if(el && el.data) Plotly.Plots.resize(el);
+    });
+  });
 }
 
 // ---- wire up inputs ----
-["geometry","material","f0","bw","n_elem","aperture","elev_h","focus","tdepth","tsize"]
+["geometry","material","apod","layout","bvdscope","f0","bw","n_elem","aperture","elev_h","focus","tdepth","tsize",
+ "diameter","ann_diam","n_ring","nx","ny","pitch_x","pitch_y"]
   .forEach(id=>$(id).addEventListener("change",()=>compute(false)));
 $("steer").addEventListener("input",e=>{$("steerVal").textContent=e.target.value+"°";});
 $("steer").addEventListener("change",()=>compute(false));
-$("mSimple").onclick=()=>{mode="simple";$("mSimple").classList.add("on");$("mExpert").classList.remove("on");compute(true);};
-$("mExpert").onclick=()=>{mode="expert";$("mExpert").classList.add("on");$("mSimple").classList.remove("on");compute(true);};
+// ---- pitch feedback (guards the aperture/n_elem grating-lobe trap) ----
+// Show only the parameter block(s) belonging to the current geometry.
+function syncGeoPanel(){
+  const geo=$("geometry").value;
+  document.querySelectorAll("[data-geo]").forEach(function(d){
+    d.style.display = d.getAttribute("data-geo").split(" ").includes(geo) ? "block" : "none";
+  });
+}
+// Per-geometry live feedback: pitch/grating for linear family, physics notes
+// for single/annular, aperture + source-count cost guard for matrix.
+function updatePitch(){
+  const geo=$("geometry").value;
+  const c=1540, f0=parseFloat($("f0").value)*1e6, lam=c/f0*1e3;   // mm
+  if(geo==="single"){
+    const D=parseFloat($("diameter").value);
+    $("singleInfo").innerHTML=`<span style="color:#58a6ff">Single element: one solid circular piezo disc, mechanical fixed focus — `+
+      `single channel, <b>no electronic focus/steer</b>, images by mechanical scanning. Aperture D=${D.toFixed(0)} mm.</span>`;
+    return;
+  }
+  if(geo==="annular"){
+    const D=parseFloat($("ann_diam").value), Nr=parseInt($("n_ring").value);
+    $("annInfo").innerHTML=`<span style="color:#58a6ff">Annular: ${Nr} equal-area concentric rings, radially symmetric — `+
+      `<b>electronic depth focus only</b>, no lateral grating lobes, but <b>cannot steer</b> (steering needs mechanical scan). Diameter ${D.toFixed(0)} mm.</span>`;
+    return;
+  }
+  if(geo==="matrix"){
+    const nx=parseInt($("nx").value), ny=parseInt($("ny").value);
+    const px=parseFloat($("pitch_x").value), py=parseFloat($("pitch_y").value);
+    const apx=(nx*px).toFixed(1), apy=(ny*py).toFixed(1);
+    const nsrc=nx*ny, rx=px/(lam/2), ry=py/(lam/2);
+    let col="#3fb950", msg="";
+    if(nsrc>2500){ col="#f85149"; msg=` — ${nsrc} elements is too many, the browser will be slow: reduce to Nx·Ny ≤ 2500`; }
+    else if(nsrc>1600){ col="#d29922"; msg=` — ${nsrc} elements, browser compute is slower`; }
+    else if(rx>1.05||ry>1.05){ col="#d29922"; msg=` — pitch>λ, grating lobes appear when steering`; }
+    $("matrixInfo").innerHTML=`<span style="color:${col}">Aperture ${apx}×${apy} mm, `+
+      `${nsrc} elements (${rx.toFixed(1)}·λ/2 × ${ry.toFixed(1)}·λ/2). Electronic focus/steer in both azimuth and elevation.${msg}</span>`;
+    return;
+  }
+  // linear / convex
+  const A=parseFloat($("aperture").value), N=parseInt($("n_elem").value);
+  const pitch=A/N, ratio=pitch/(lam/2);
+  let col="#3fb950", msg="";
+  if(ratio>2.2){ col="#f85149"; msg=" — grating-lobe risk: add elements or shrink aperture"; }
+  else if(ratio>1.6){ col="#d29922"; msg=" — approaching grating-lobe limit"; }
+  $("pitchInfo").innerHTML=`<span style="color:${col}">pitch = ${pitch.toFixed(2)} mm `+
+    `(${ratio.toFixed(1)}·λ/2)${msg}</span>`;
+}
+["aperture","n_elem","f0","diameter","ann_diam","n_ring","nx","ny","pitch_x","pitch_y"]
+  .forEach(id=>$(id).addEventListener("input",updatePitch));
+$("geometry").addEventListener("change",function(){ syncGeoPanel(); updatePitch(); });
+
+function setMode(m){
+  mode=m;
+  document.body.classList.toggle("expert", m==="expert");
+  $("mSimple").classList.toggle("on", m==="simple");
+  $("mExpert").classList.toggle("on", m==="expert");
+  // single/annular/matrix are Expert-only geometries: hide them in Simple and
+  // fall back to linear if one was selected when leaving Expert.
+  var expert = (m==="expert");
+  document.querySelectorAll("#geometry .geo-expert").forEach(function(o){
+    o.hidden = !expert; o.disabled = !expert;
+  });
+  if(!expert && ["single","annular","matrix"].includes(geometry_val())){
+    $("geometry").value="linear";
+  }
+  syncGeoPanel(); updatePitch(); compute(true);
+}
+function geometry_val(){ return $("geometry").value; }
+$("mSimple").onclick=()=>setMode("simple");
+$("mExpert").onclick=()=>setMode("expert");
 $("limits").innerHTML = "Linear acoustics only — no harmonic/nonlinear (THI), "+
   "single scattering, homogeneous c=1540 m/s. Lateral FWHM is two-way (pulse-echo).";
 
