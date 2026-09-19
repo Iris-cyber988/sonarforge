@@ -394,7 +394,7 @@ def field_map(t: Transducer, plane="xz", steer_deg=0.0,
     amp = _apod_amp(t)
     if extent is None:
         half = max(t.aperture, t.elev_h)
-        extent = (-1.2 * half, 1.2 * half, 0.2 * t.focus, 1.6 * t.focus)
+        extent = (-1.7 * half, 1.7 * half, 0.2 * t.focus, 1.6 * t.focus)
     a0, a1, z0, z1 = extent
     zg = np.linspace(z0, z1, nz)
     ag = np.linspace(a0, a1, nx)
@@ -634,61 +634,78 @@ def full_report(t: Transducer, target_depth=None, target_size=None) -> dict:
 </script>
 <style>
   :root{--bg:#0d1117;--panel:#161b22;--edge:#30363d;--txt:#e6edf3;--muted:#8b949e;
-        --accent:#2f81f7;--ok:#3fb950;--warn:#d29922;--bad:#f85149;}
+        --accent:#2f81f7;--ok:#3fb950;--warn:#d29922;--bad:#f85149;
+        --radius:12px;--shadow:0 2px 10px rgba(0,0,0,.28)}
   *{box-sizing:border-box}
-  body{margin:0;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;
-       background:var(--bg);color:var(--txt)}
-  header{padding:12px 20px;border-bottom:1px solid var(--edge);display:flex;
-         align-items:center;gap:14px}
-  header h1{font-size:17px;margin:0;font-weight:650}
-  header .tag{color:var(--muted);font-size:12px}
-  #status{margin-left:auto;font-size:12px;color:var(--warn)}
-  .wrap{display:grid;grid-template-columns:350px 1fr;gap:0;height:calc(100vh - 52px)}
-  .side{background:var(--panel);border-right:1px solid var(--edge);padding:20px 22px;
+  html,body{height:100%}
+  body{margin:0;font:14px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;
+       background:var(--bg);color:var(--txt);-webkit-font-smoothing:antialiased;
+       display:flex;flex-direction:column;overflow:hidden}
+  header{padding:16px 24px;border-bottom:1px solid var(--edge);flex:0 0 auto}
+  .header-top{display:flex;align-items:center;gap:14px}
+  header h1{font-size:19px;margin:0;font-weight:700;letter-spacing:-.2px}
+  .header-desc{margin:8px 0 0;color:var(--muted);font-size:12.5px;line-height:1.55;max-width:960px}
+  #status{margin-left:auto;font-size:12px;color:var(--warn);background:rgba(255,255,255,.04);
+        border:1px solid var(--edge);padding:5px 12px;border-radius:999px;white-space:nowrap}
+  .wrap{display:grid;grid-template-columns:350px 1fr;gap:0;flex:1 1 auto;min-height:0}
+  .side{background:var(--panel);border-right:1px solid var(--edge);padding:22px 24px;
         overflow:auto}
-  .side h2{font-size:12.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);
-           margin:22px 0 12px}
-  .side h2:first-of-type{margin-top:2px}
-  .fld{margin-bottom:13px}
-  .fld label{display:block;font-size:12.5px;color:var(--muted);margin-bottom:4px}
+  .side h2{font-size:12.5px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;
+           color:var(--muted);margin:26px 0 14px;padding-left:12px;position:relative}
+  .side h2::before{content:"";position:absolute;left:0;top:50%;width:5px;height:5px;
+        border-radius:50%;background:var(--accent);transform:translateY(-50%)}
+  .side h2:first-of-type{margin-top:0}
+  .fld{margin-bottom:14px}
+  .fld label{display:block;font-size:12.5px;color:var(--muted);margin-bottom:5px}
   .fld input,.fld select,.fld textarea{width:100%;background:#0d1117;color:var(--txt);
-        border:1px solid var(--edge);border-radius:6px;padding:8px 10px;font-size:14px;
-        font-family:inherit}
-  .fld textarea{resize:vertical;font-size:13px;line-height:1.45}
+        border:1px solid var(--edge);border-radius:8px;padding:9px 11px;font-size:14px;
+        font-family:inherit;transition:border-color .15s,box-shadow .15s}
+  .fld input:focus,.fld select:focus,.fld textarea:focus{outline:none;border-color:var(--accent);
+        box-shadow:0 0 0 3px rgba(47,129,247,.18)}
+  .fld textarea{resize:vertical;font-size:13px;line-height:1.5}
   .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
   [data-geo]{display:none}
-  #pitchInfo,#singleInfo,#annInfo,#matrixInfo{font-size:12px;margin:-3px 0 13px;line-height:1.45}
-  .prompt-box{margin-bottom:8px}
+  #pitchInfo,#singleInfo,#annInfo,#matrixInfo{font-size:12px;margin:-3px 0 13px;line-height:1.5}
+  .intro-card{background:linear-gradient(160deg,rgba(47,129,247,.12),rgba(47,129,247,.03));
+        border:1px solid rgba(47,129,247,.35);border-radius:var(--radius);padding:18px;
+        margin-bottom:4px}
+  .prompt-box{margin-bottom:10px}
   .btn-parse{width:100%;background:var(--accent);border:1px solid var(--accent);color:#fff;
-        padding:10px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:600}
-  .btn-parse:hover{filter:brightness(1.1)}
-  #promptFeedback{font-size:12px;color:var(--muted);margin:10px 0 6px;line-height:1.55}
-  #promptFeedback b{color:var(--accent);font-weight:600}
+        padding:12px;border-radius:999px;cursor:pointer;font-size:14px;font-weight:650;
+        letter-spacing:.2px;box-shadow:0 3px 10px rgba(47,129,247,.35);
+        transition:filter .15s,transform .1s}
+  .btn-parse:hover{filter:brightness(1.12)}
+  .btn-parse:active{transform:scale(.98)}
+  #promptFeedback{font-size:12.5px;color:var(--muted);margin:12px 0 2px;line-height:1.6}
+  #promptFeedback b{color:var(--accent);font-weight:650}
   #promptFeedback .warn{color:var(--warn)}
-  .main{overflow:auto;padding:22px 26px}
+  .main{overflow:auto;padding:26px 30px}
   .main-inner{max-width:1680px;margin:0 auto}
-  .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:18px}
-  .card{background:var(--panel);border:1px solid var(--edge);border-radius:10px;
-        padding:16px 18px}
-  .card .k{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
-  .card .v{font-size:27px;font-weight:650;margin-top:6px}
+  .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:20px}
+  .card{background:var(--panel);border:1px solid var(--edge);border-top:3px solid var(--edge);
+        border-radius:var(--radius);padding:17px 19px;box-shadow:var(--shadow)}
+  .card .k{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;
+        font-weight:650}
+  .card .v{font-size:28px;font-weight:700;margin-top:7px;letter-spacing:-.3px}
   .card .u{font-size:12.5px;color:var(--muted)}
-  .card.ok{border-color:#238636}.card.bad{border-color:#8b2a25}
+  .card.ok{border-top-color:var(--ok)}.card.ok .v{color:var(--ok)}
+  .card.bad{border-top-color:var(--bad)}.card.bad .v{color:var(--bad)}
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
-  .panel{background:var(--panel);border:1px solid var(--edge);border-radius:10px;
-         padding:14px;display:flex;flex-direction:column}
+  .panel{background:var(--panel);border:1px solid var(--edge);border-radius:var(--radius);
+         padding:16px;display:flex;flex-direction:column;box-shadow:var(--shadow)}
   .plot{height:36vh;min-height:300px}
   .plot .js-plotly-plot,.plot .plot-container{width:100%!important;height:100%!important}
   #pBMODE{height:38vh;min-height:320px}
-#pXZ,#pYZ{height:44vh;min-height:380px}
-  .cap{margin-top:12px;padding-top:12px;border-top:1px solid var(--edge)}
-  .cap .method{font-size:12.5px;color:var(--muted);line-height:1.55}
-  .cap .reading{font-size:14px;color:var(--txt);line-height:1.6;margin-top:8px}
-  .cap .reading b{color:var(--accent);font-weight:600}
-  .advisor{background:var(--panel);border:1px solid var(--edge);border-radius:10px;
-           padding:16px 20px;font-size:14px;line-height:1.6;overflow:auto}
+#pXZ,#pYZ{height:72vh;min-height:580px}
+  .cap{margin-top:14px;padding-top:14px;border-top:1px solid var(--edge)}
+  .cap .method{font-size:12.5px;color:var(--muted);line-height:1.6}
+  .cap .reading{font-size:14px;color:var(--txt);line-height:1.6;margin-top:9px}
+  .cap .reading b{color:var(--accent);font-weight:650}
+  .advisor{background:var(--panel);border:1px solid var(--edge);border-left:3px solid var(--accent);
+           border-radius:var(--radius);padding:18px 22px;font-size:14px;line-height:1.6;
+           overflow:auto;box-shadow:var(--shadow)}
   .advisor .warn{color:var(--warn)} .advisor .note{color:var(--muted)}
-  .foot{color:var(--muted);font-size:12px;margin-top:18px;line-height:1.65}
+  .foot{color:var(--muted);font-size:12px;margin-top:20px;line-height:1.65}
   .spin{display:inline-block;width:11px;height:11px;border:2px solid var(--muted);
         border-top-color:transparent;border-radius:50%;animation:s .7s linear infinite;
         vertical-align:-1px;margin-right:5px}
@@ -697,20 +714,26 @@ def full_report(t: Transducer, target_depth=None, target_size=None) -> dict:
 </head>
 <body>
 <header>
-  <h1>SonarForge&nbsp;AI</h1>
-  <span class="tag">accessible ultrasound field &amp; transducer explorer</span>
-  <span id="status"><span class="spin"></span>booting Pyodide…</span>
+  <div class="header-top">
+    <h1>SonarForge&nbsp;AI — Ultrasound Field Explorer</h1>
+    <span id="status"><span class="spin"></span>booting Pyodide…</span>
+  </div>
+  <p class="header-desc">A friendly, citation-ready prototype for turning plain-language transducer
+    ideas into acoustic-field intuition. Uses simplified linear acoustics and Rayleigh–Sommerfeld
+    coherent summation. Not yet a validated replacement for Field II, k-Wave, OnScale/PZFlex, or PiezoCAD.</p>
 </header>
 
 <div class="wrap">
   <!-- ============ PARAMETER PANEL ============ -->
   <aside class="side">
-    <h2>Describe your transducer</h2>
-    <div class="fld prompt-box">
-      <textarea id="promptText" rows="3" placeholder="e.g. linear array, 64 elements, 5 MHz, aperture 25 mm, focus 50 mm, PZT-5H — resolve a 2 mm target at 5 cm depth"></textarea>
+    <div class="intro-card">
+      <h2>Describe your transducer</h2>
+      <div class="fld prompt-box">
+        <textarea id="promptText" rows="3" placeholder="e.g. linear array, 64 elements, 5 MHz, aperture 25 mm, focus 50 mm, PZT-5H — resolve a 2 mm target at 5 cm depth"></textarea>
+      </div>
+      <button id="parseBtn" type="button" class="btn-parse">Parse prompt</button>
+      <div id="promptFeedback"></div>
     </div>
-    <button id="parseBtn" type="button" class="btn-parse">Parse prompt</button>
-    <div id="promptFeedback"></div>
 
     <h2>Geometry</h2>
     <div class="fld"><label>Array type</label>
