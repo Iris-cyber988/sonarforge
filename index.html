@@ -650,13 +650,22 @@ def full_report(t: Transducer, target_depth=None, target_size=None) -> dict:
            margin:16px 0 8px}
   .fld{margin-bottom:9px}
   .fld label{display:block;font-size:12px;color:var(--muted);margin-bottom:2px}
-  .fld input,.fld select{width:100%;background:#0d1117;color:var(--txt);
-        border:1px solid var(--edge);border-radius:6px;padding:5px 7px;font-size:13px}
+  .fld input,.fld select,.fld textarea{width:100%;background:#0d1117;color:var(--txt);
+        border:1px solid var(--edge);border-radius:6px;padding:5px 7px;font-size:13px;
+        font-family:inherit}
+  .fld textarea{resize:vertical;font-size:12.5px;line-height:1.4}
   .row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
   .expert-only{display:none}
   body.expert .expert-only{display:block}
   [data-geo]{display:none}
   #pitchInfo,#singleInfo,#annInfo,#matrixInfo{font-size:11.5px;margin:-2px 0 9px;line-height:1.3}
+  .prompt-box{margin-bottom:6px}
+  .btn-parse{width:100%;background:var(--accent);border:1px solid var(--accent);color:#fff;
+        padding:7px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600}
+  .btn-parse:hover{filter:brightness(1.1)}
+  #promptFeedback{font-size:11.5px;color:var(--muted);margin:8px 0 4px;line-height:1.45}
+  #promptFeedback b{color:var(--accent);font-weight:600}
+  #promptFeedback .warn{color:var(--warn)}
   .main{overflow:auto;padding:16px 18px}
   .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}
   .card{background:var(--panel);border:1px solid var(--edge);border-radius:10px;
@@ -704,6 +713,13 @@ def full_report(t: Transducer, target_depth=None, target_size=None) -> dict:
       <button id="mSimple" class="on">Simple</button>
       <button id="mExpert">Expert</button>
     </div>
+
+    <h2>Describe your transducer</h2>
+    <div class="fld prompt-box">
+      <textarea id="promptText" rows="3" placeholder="e.g. linear array, 64 elements, 5 MHz, aperture 25 mm, focus 50 mm, PZT-5H — resolve a 2 mm target at 5 cm depth"></textarea>
+    </div>
+    <button id="parseBtn" type="button" class="btn-parse">Parse prompt</button>
+    <div id="promptFeedback"></div>
 
     <h2>Geometry</h2>
     <div class="fld"><label>Array type</label>
@@ -1186,7 +1202,7 @@ function updatePitch(){
   .forEach(id=>$(id).addEventListener("input",updatePitch));
 $("geometry").addEventListener("change",function(){ syncGeoPanel(); updatePitch(); });
 
-function setMode(m){
+function setMode(m, skipCompute){
   mode=m;
   document.body.classList.toggle("expert", m==="expert");
   $("mSimple").classList.toggle("on", m==="simple");
@@ -1200,7 +1216,8 @@ function setMode(m){
   if(!expert && ["single","annular","matrix"].includes(geometry_val())){
     $("geometry").value="linear";
   }
-  syncGeoPanel(); updatePitch(); compute(true);
+  syncGeoPanel(); updatePitch();
+  if(!skipCompute) compute(true);
 }
 function geometry_val(){ return $("geometry").value; }
 $("mSimple").onclick=()=>setMode("simple");
@@ -1217,6 +1234,150 @@ window.addEventListener("resize",()=>{
       const el=$(id); if(el && el.data) Plotly.Plots.resize(el);
     });
   },150);
+});
+
+// ---- plain-language prompt parser --------------------------------------
+// Lightweight regex parser (not an LLM): pulls the same fields the structured
+// form uses out of a free-text description, e.g. "linear array, 64 elements,
+// 5 MHz, aperture 25 mm, focus 50 mm, PZT-5H, resolve a 2 mm target at 5 cm
+// depth". Anything it can't find is simply left at its current value.
+const MATERIAL_ALIASES = {
+  "pzt-5h":"PZT-5H","pzt 5h":"PZT-5H","pzt5h":"PZT-5H",
+  "pmn-pt":"PMN-PT","pmn pt":"PMN-PT","pmnpt":"PMN-PT",
+  "pzt-4":"PZT-4","pzt 4":"PZT-4","pzt4":"PZT-4",
+  "pzt-8":"PZT-8","pzt 8":"PZT-8","pzt8":"PZT-8",
+  "pvdf":"PVDF","lithium niobate":"LiNbO3","linbo3":"LiNbO3",
+  "piezocomposite":"Piezocomposite","piezo composite":"Piezocomposite",
+  "1-3 composite":"Piezocomposite","composite":"Piezocomposite",
+};
+function num(re, text){ const m = text.match(re); return m ? parseFloat(m[1]) : null; }
+
+function parsePrompt(text){
+  const t = " " + text.toLowerCase() + " ";
+  const found = {};
+
+  if(/\bsingle[\s-]?element\b|\bsingle[\s-]?piston\b/.test(t)) found.geometry="single";
+  else if(/\bannular\b/.test(t)) found.geometry="annular";
+  else if(/\bmatrix\b|\b2d\s*array\b/.test(t)) found.geometry="matrix";
+  else if(/\bconvex\b|\bcurvilinear\b/.test(t)) found.geometry="convex";
+  else if(/\blinear\b|\bphased\b/.test(t)) found.geometry="linear";
+
+  let v = num(/(\d+(?:\.\d+)?)\s*mhz/, t);
+  if(v!=null) found.f0=v;
+
+  v = num(/(\d+)\s*(?:elements?|channels?)\b/, t);
+  if(v!=null) found.n_elem=v;
+
+  v = num(/apertur\w*[^0-9]{0,10}(\d+(?:\.\d+)?)\s*mm/, t) ?? num(/(\d+(?:\.\d+)?)\s*mm\s*apertur\w*/, t);
+  if(v!=null) found.aperture=v;
+
+  v = num(/diamet\w*[^0-9]{0,10}(\d+(?:\.\d+)?)\s*mm/, t) ?? num(/(\d+(?:\.\d+)?)\s*mm\s*diamet\w*/, t);
+  if(v!=null) found.diameter=v;
+
+  v = num(/elevation(?:\s*height)?[^0-9]{0,10}(\d+(?:\.\d+)?)\s*mm/, t);
+  if(v!=null) found.elev_h=v;
+
+  v = num(/focus\w*(?:\s*(?:depth|at|of))?[^0-9]{0,10}(\d+(?:\.\d+)?)\s*mm/, t);
+  if(v!=null) found.focus=v;
+
+  v = num(/(\d+)\s*rings?\b/, t);
+  if(v!=null) found.n_ring=v;
+
+  v = num(/(\d+(?:\.\d+)?)\s*%\s*bandwidth/, t);
+  if(v!=null) found.bw=v/100;
+  else { v = num(/bandwidth[^0-9]{0,10}(0?\.\d+)/, t); if(v!=null) found.bw=v; }
+
+  v = num(/steer\w*[^0-9-]{0,10}(-?\d+(?:\.\d+)?)\s*(?:°|deg)/, t) ?? num(/(-?\d+(?:\.\d+)?)\s*(?:°|degrees?)\s*steer/, t);
+  if(v!=null) found.steer=v;
+
+  if(/\bhann\b/.test(t)) found.apod="hann";
+  else if(/\bhamming\b/.test(t)) found.apod="hamming";
+  else if(/\btukey\b/.test(t)) found.apod="tukey";
+  else if(/\brectangular\b|\buniform\s+window\b/.test(t)) found.apod="rectangular";
+
+  if(/\bsparse\b/.test(t)) found.layout="sparse";
+  else if(/\bjitter\w*\b/.test(t)) found.layout="jitter";
+
+  for(const key in MATERIAL_ALIASES){
+    if(t.includes(key)){ found.material = MATERIAL_ALIASES[key]; break; }
+  }
+
+  if(/all\s*channels|parallel|shorted/.test(t)) found.bvdscope="array";
+  else if(/per[\s-]?channel|per[\s-]?element/.test(t)) found.bvdscope="element";
+
+  v = num(/(\d+(?:\.\d+)?)\s*mm\s*(?:structure|target|vessel|lesion|cyst|wire|feature)/, t);
+  if(v!=null) found.tsize=v;
+  else { v = num(/(?:resolv\w*|target)[^0-9]{0,15}(\d+(?:\.\d+)?)\s*mm/, t); if(v!=null) found.tsize=v; }
+
+  let depthMM = num(/(\d+(?:\.\d+)?)\s*cm\s*depth/, t);
+  if(depthMM!=null){ depthMM*=10; }
+  else{
+    depthMM = num(/depth\s*(?:of)?[^0-9]{0,10}(\d+(?:\.\d+)?)\s*cm/, t);
+    if(depthMM!=null) depthMM*=10;
+    else depthMM = num(/(\d+(?:\.\d+)?)\s*mm\s*depth/, t) ?? num(/depth[^0-9]{0,10}(\d+(?:\.\d+)?)\s*mm/, t);
+  }
+  if(depthMM!=null) found.tdepth=depthMM;
+
+  const mtx = t.match(/(\d+)\s*(?:x|×|by)\s*(\d+)/);
+  if(mtx && (found.geometry==="matrix" || /matrix/.test(t))){
+    found.geometry="matrix"; found.nx=parseInt(mtx[1]); found.ny=parseInt(mtx[2]);
+  }
+  v = num(/pitch\w*(?:\s*x)?[^0-9]{0,10}(\d+(?:\.\d+)?)\s*mm/, t);
+  if(v!=null){ found.pitch_x=v; if(found.pitch_y==null) found.pitch_y=v; }
+
+  return found;
+}
+
+function needsExpert(found){
+  return found.material!=null || found.bw!=null || (found.steer!=null && found.steer!==0) ||
+    (found.apod!=null && found.apod!=="rectangular") || (found.layout!=null && found.layout!=="uniform") ||
+    found.bvdscope!=null || found.elev_h!=null ||
+    ["single","annular","matrix"].includes(found.geometry);
+}
+
+function applyParsed(found){
+  const applied = [];
+  if(found.geometry!=null){ $("geometry").value=found.geometry; applied.push(`array = ${found.geometry}`); }
+  const geo = $("geometry").value;
+  if(found.f0!=null){ $("f0").value=found.f0; applied.push(`f0 = ${found.f0} MHz`); }
+  if(found.n_elem!=null && (geo==="linear"||geo==="convex")){ $("n_elem").value=found.n_elem; applied.push(`elements = ${found.n_elem}`); }
+  if(found.aperture!=null && (geo==="linear"||geo==="convex")){ $("aperture").value=found.aperture; applied.push(`aperture = ${found.aperture} mm`); }
+  if(found.diameter!=null && geo==="single"){ $("diameter").value=found.diameter; applied.push(`diameter = ${found.diameter} mm`); }
+  if(found.diameter!=null && geo==="annular"){ $("ann_diam").value=found.diameter; applied.push(`diameter = ${found.diameter} mm`); }
+  if(found.n_ring!=null && geo==="annular"){ $("n_ring").value=found.n_ring; applied.push(`rings = ${found.n_ring}`); }
+  if(found.nx!=null && geo==="matrix"){ $("nx").value=found.nx; applied.push(`nx = ${found.nx}`); }
+  if(found.ny!=null && geo==="matrix"){ $("ny").value=found.ny; applied.push(`ny = ${found.ny}`); }
+  if(found.pitch_x!=null && geo==="matrix"){ $("pitch_x").value=found.pitch_x; $("pitch_y").value=found.pitch_y; applied.push(`pitch = ${found.pitch_x} mm`); }
+  if(found.elev_h!=null){ $("elev_h").value=found.elev_h; applied.push(`elevation height = ${found.elev_h} mm`); }
+  if(found.focus!=null){ $("focus").value=found.focus; applied.push(`focus = ${found.focus} mm`); }
+  if(found.bw!=null){ $("bw").value=found.bw; applied.push(`bandwidth = ${found.bw}`); }
+  if(found.steer!=null){ $("steer").value=found.steer; $("steerVal").textContent=found.steer+"°"; applied.push(`steer = ${found.steer}°`); }
+  if(found.apod!=null){ $("apod").value=found.apod; applied.push(`apodization = ${found.apod}`); }
+  if(found.layout!=null){ $("layout").value=found.layout; applied.push(`layout = ${found.layout}`); }
+  if(found.material!=null){ $("material").value=found.material; applied.push(`material = ${found.material}`); }
+  if(found.bvdscope!=null){ $("bvdscope").value=found.bvdscope; applied.push(`impedance scope = ${found.bvdscope}`); }
+  if(found.tdepth!=null){ $("tdepth").value=found.tdepth; applied.push(`target depth = ${found.tdepth} mm`); }
+  if(found.tsize!=null){ $("tsize").value=found.tsize; applied.push(`target size = ${found.tsize} mm`); }
+  return applied;
+}
+
+$("parseBtn").addEventListener("click", ()=>{
+  const text = $("promptText").value.trim();
+  const fb = $("promptFeedback");
+  if(!text){
+    fb.innerHTML = `<span class="warn">Type a description first — e.g. "linear array, 64 elements, `+
+      `5 MHz, aperture 25 mm, focus 50 mm, PZT-5H, resolve a 2 mm target at 5 cm depth".</span>`;
+    return;
+  }
+  const found = parsePrompt(text);
+  if(needsExpert(found) && mode!=="expert") setMode("expert", true);
+  const applied = applyParsed(found);
+  syncGeoPanel(); updatePitch(); compute(true);
+  fb.innerHTML = applied.length
+    ? `Parsed: ${applied.map(a=>`<b>${a}</b>`).join(", ")}.`+
+      (found.f0==null ? ` Frequency not mentioned — kept ${$("f0").value} MHz.` : "")
+    : `<span class="warn">Couldn't recognize any parameters — try adding numbers with units, `+
+      `e.g. "5 MHz", "aperture 25 mm", "5 cm depth".</span>`;
 });
 
 boot();
