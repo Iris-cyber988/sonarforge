@@ -978,11 +978,15 @@ function compute(highres=false){
   }, 20);
 }
 
+// scaleanchor/scaleratio locks 1 mm on x to 1 mm on y so the beam shape isn't
+// stretched by whatever aspect ratio the panel happens to have.
 const heat = (div,d,title,xlab,ylab)=>Plotly.react(div,[{z:d.z,x:d.x,y:d.y,type:"heatmap",
     zmin:-40,zmax:0,colorscale:INFERNO,colorbar:{title:"dB",thickness:10}}],
     {title:{text:title,font:{size:13,color:"#e6edf3"}},margin:{l:52,r:10,t:34,b:44},
      paper_bgcolor:"#161b22",plot_bgcolor:"#000004",font:{color:"#8b949e",size:11},
-     xaxis:{title:xlab},yaxis:{title:ylab,autorange:"reversed"}},{displayModeBar:false,responsive:true});
+     xaxis:{title:xlab,constrain:"domain"},
+     yaxis:{title:ylab,autorange:"reversed",scaleanchor:"x",scaleratio:1,constrain:"domain"}},
+    {displayModeBar:false,responsive:true});
 
 function render(r,s){
   if(typeof Plotly==="undefined"){
@@ -1049,8 +1053,9 @@ function render(r,s){
      colorscale:[[0,"#000000"],[1,"#ffffff"]],showscale:false}],
     {title:{text:"B-mode phantom (wire + cyst + speckle)",font:{size:13,color:"#e6edf3"}},
      margin:{l:52,r:10,t:34,b:44},paper_bgcolor:"#161b22",plot_bgcolor:"#000000",
-     font:{color:"#8b949e",size:11},yaxis:{autorange:"reversed",title:"depth z [mm]"},
-     xaxis:{title:"lateral x [mm]"}},{displayModeBar:false,responsive:true});
+     font:{color:"#8b949e",size:11},
+     yaxis:{autorange:"reversed",title:"depth z [mm]",scaleanchor:"x",scaleratio:1,constrain:"domain"},
+     xaxis:{title:"lateral x [mm]",constrain:"domain"}},{displayModeBar:false,responsive:true});
 
   // ---- dynamic readings (one plain-language conclusion per panel) ----
   const focusMM = s.focus*1e3, tsizeMM = s.tsize*1e3;
