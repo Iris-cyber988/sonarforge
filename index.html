@@ -654,14 +654,14 @@ def full_report(t: Transducer, target_depth=None, target_size=None,
         --radius:12px;--shadow:0 2px 10px rgba(0,0,0,.28)}
   *{box-sizing:border-box}
   html,body{height:100%}
-  body{margin:0;font:14px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;
+  body{margin:0;font:17px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;
        background:var(--bg);color:var(--txt);-webkit-font-smoothing:antialiased;
        display:flex;flex-direction:column;overflow:hidden}
   header{padding:16px 24px;border-bottom:1px solid var(--edge);flex:0 0 auto}
   .header-top{display:flex;align-items:center;gap:14px}
-  header h1{font-size:19px;margin:0;font-weight:700;letter-spacing:-.2px}
-  .header-desc{margin:8px 0 0;color:var(--muted);font-size:12.5px;line-height:1.55;max-width:960px}
-  #status{margin-left:auto;font-size:12px;color:var(--warn);background:rgba(255,255,255,.04);
+  header h1{font-size:23px;margin:0;font-weight:700;letter-spacing:-.2px}
+  .header-desc{margin:8px 0 0;color:var(--muted);font-size:15px;line-height:1.55;max-width:960px}
+  #status{margin-left:auto;font-size:14px;color:var(--warn);background:rgba(255,255,255,.04);
         border:1px solid var(--edge);padding:5px 12px;border-radius:999px;white-space:nowrap}
   .wrap{display:grid;grid-template-columns:350px 1fr;gap:0;flex:1 1 auto;min-height:0}
   .side{background:var(--panel);border-right:1px solid var(--edge);
@@ -669,37 +669,37 @@ def full_report(t: Transducer, target_depth=None, target_size=None,
   .side-scroll{flex:1 1 auto;overflow:auto;padding:22px 24px}
   .side-footer{flex:0 0 auto;padding:14px 24px 18px;border-top:1px solid var(--edge);
         background:var(--panel)}
-  .sim-status{font-size:12px;color:var(--muted);margin-bottom:9px;min-height:15px;line-height:1.4}
+  .sim-status{font-size:14px;color:var(--muted);margin-bottom:9px;min-height:15px;line-height:1.4}
   .sim-status.dirty{color:var(--warn)}
   .btn-simulate{background:var(--ok);border-color:var(--ok);
         box-shadow:0 3px 10px rgba(63,185,80,.35)}
-  .side h2{font-size:12.5px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;
+  .side h2{font-size:15px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;
            color:var(--muted);margin:26px 0 14px;padding-left:12px;position:relative}
   .side h2::before{content:"";position:absolute;left:0;top:50%;width:5px;height:5px;
         border-radius:50%;background:var(--accent);transform:translateY(-50%)}
   .side h2:first-of-type{margin-top:0}
   .fld{margin-bottom:14px}
-  .fld label{display:block;font-size:12.5px;color:var(--muted);margin-bottom:5px}
+  .fld label{display:block;font-size:15px;color:var(--muted);margin-bottom:5px}
   .fld input,.fld select,.fld textarea{width:100%;background:#0d1117;color:var(--txt);
-        border:1px solid var(--edge);border-radius:8px;padding:9px 11px;font-size:14px;
+        border:1px solid var(--edge);border-radius:8px;padding:9px 11px;font-size:17px;
         font-family:inherit;transition:border-color .15s,box-shadow .15s}
   .fld input:focus,.fld select:focus,.fld textarea:focus{outline:none;border-color:var(--accent);
         box-shadow:0 0 0 3px rgba(47,129,247,.18)}
-  .fld textarea{resize:vertical;font-size:13px;line-height:1.5}
+  .fld textarea{resize:vertical;font-size:16px;line-height:1.5}
   .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
   [data-geo]{display:none}
-  #pitchInfo,#singleInfo,#annInfo,#matrixInfo{font-size:12px;margin:-3px 0 13px;line-height:1.5}
+  #pitchInfo,#singleInfo,#annInfo,#matrixInfo{font-size:14.5px;margin:-3px 0 13px;line-height:1.5}
   .intro-card{background:linear-gradient(160deg,rgba(47,129,247,.12),rgba(47,129,247,.03));
         border:1px solid rgba(47,129,247,.35);border-radius:var(--radius);padding:18px;
         margin-bottom:4px}
   .prompt-box{margin-bottom:10px}
   .btn-parse{width:100%;background:var(--accent);border:1px solid var(--accent);color:#fff;
-        padding:12px;border-radius:999px;cursor:pointer;font-size:14px;font-weight:650;
+        padding:12px;border-radius:999px;cursor:pointer;font-size:16px;font-weight:650;
         letter-spacing:.2px;box-shadow:0 3px 10px rgba(47,129,247,.35);
         transition:filter .15s,transform .1s}
   .btn-parse:hover{filter:brightness(1.12)}
   .btn-parse:active{transform:scale(.98)}
-  #promptFeedback{font-size:12.5px;color:var(--muted);margin:12px 0 2px;line-height:1.6}
+  #promptFeedback{font-size:15px;color:var(--muted);margin:12px 0 2px;line-height:1.6}
   #promptFeedback b{color:var(--accent);font-weight:650}
   #promptFeedback .warn{color:var(--warn)}
   .main{overflow:auto;padding:26px 30px}
@@ -707,10 +707,10 @@ def full_report(t: Transducer, target_depth=None, target_size=None,
   .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:20px}
   .card{background:var(--panel);border:1px solid var(--edge);border-top:3px solid var(--edge);
         border-radius:var(--radius);padding:17px 19px;box-shadow:var(--shadow)}
-  .card .k{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;
+  .card .k{font-size:13.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;
         font-weight:650}
-  .card .v{font-size:28px;font-weight:700;margin-top:7px;letter-spacing:-.3px}
-  .card .u{font-size:12.5px;color:var(--muted)}
+  .card .v{font-size:32px;font-weight:700;margin-top:7px;letter-spacing:-.3px}
+  .card .u{font-size:15px;color:var(--muted)}
   .card.ok{border-top-color:var(--ok)}.card.ok .v{color:var(--ok)}
   .card.bad{border-top-color:var(--bad)}.card.bad .v{color:var(--bad)}
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
@@ -721,14 +721,14 @@ def full_report(t: Transducer, target_depth=None, target_size=None,
   #pBMODE{height:38vh;min-height:320px}
 #pXZ,#pYZ{height:72vh;min-height:580px}
   .cap{margin-top:14px;padding-top:14px;border-top:1px solid var(--edge)}
-  .cap .method{font-size:12.5px;color:var(--muted);line-height:1.6}
-  .cap .reading{font-size:14px;color:var(--txt);line-height:1.6;margin-top:9px}
+  .cap .method{font-size:15px;color:var(--muted);line-height:1.6}
+  .cap .reading{font-size:16px;color:var(--txt);line-height:1.6;margin-top:9px}
   .cap .reading b{color:var(--accent);font-weight:650}
   .advisor{background:var(--panel);border:1px solid var(--edge);border-left:3px solid var(--accent);
-           border-radius:var(--radius);padding:18px 22px;font-size:14px;line-height:1.6;
+           border-radius:var(--radius);padding:18px 22px;font-size:16px;line-height:1.6;
            overflow:auto;box-shadow:var(--shadow)}
   .advisor .warn{color:var(--warn)} .advisor .note{color:var(--muted)}
-  .foot{color:var(--muted);font-size:12px;margin-top:20px;line-height:1.65}
+  .foot{color:var(--muted);font-size:14px;margin-top:20px;line-height:1.65}
   .spin{display:inline-block;width:11px;height:11px;border:2px solid var(--muted);
         border-top-color:transparent;border-radius:50%;animation:s .7s linear infinite;
         vertical-align:-1px;margin-right:5px}
@@ -1036,8 +1036,8 @@ function compute(){
 // stretched by whatever aspect ratio the panel happens to have.
 const heat = (div,d,title,xlab,ylab)=>Plotly.react(div,[{z:d.z,x:d.x,y:d.y,type:"heatmap",
     zmin:-40,zmax:0,colorscale:INFERNO,colorbar:{title:"dB",thickness:10}}],
-    {title:{text:title,font:{size:13,color:"#e6edf3"}},margin:{l:52,r:10,t:34,b:44},
-     paper_bgcolor:"#161b22",plot_bgcolor:"#000004",font:{color:"#8b949e",size:11},
+    {title:{text:title,font:{size:15,color:"#e6edf3"}},margin:{l:56,r:10,t:36,b:48},
+     paper_bgcolor:"#161b22",plot_bgcolor:"#000004",font:{color:"#8b949e",size:13},
      xaxis:{title:xlab,constrain:"domain"},
      yaxis:{title:ylab,autorange:"reversed",scaleanchor:"x",scaleratio:1,constrain:"domain"}},
     {displayModeBar:false,responsive:true});
@@ -1066,13 +1066,13 @@ function render(r,s){
   if(r.psf) Plotly.react($("pPSF"),[
     {x:r.psf.x0,y:r.psf.p0,name:`on-axis ${r.psf.fwhm0.toFixed(2)}mm`,line:{color:"#2f81f7"}},
     {x:r.psf.x,y:r.psf.p,name:`steer ${s.steer}° ${r.psf.fwhm.toFixed(2)}mm`,line:{color:"#d29922"}},
-  ],{title:{text:"Lateral PSF",font:{size:13,color:"#e6edf3"}},autosize:true,
-     margin:{l:48,r:20,t:34,b:42},paper_bgcolor:"#161b22",plot_bgcolor:"#161b22",
-     font:{color:"#8b949e",size:11},
+  ],{title:{text:"Lateral PSF",font:{size:15,color:"#e6edf3"}},autosize:true,
+     margin:{l:52,r:20,t:36,b:46},paper_bgcolor:"#161b22",plot_bgcolor:"#161b22",
+     font:{color:"#8b949e",size:13},
      yaxis:{range:[-50,2],title:"dB",showgrid:true,gridcolor:"#484f58",griddash:"dot",gridwidth:1},
      xaxis:{title:"x [mm]",zeroline:true,zerolinecolor:"#30363d",
             showgrid:true,gridcolor:"#484f58",griddash:"dot",gridwidth:1},
-     legend:{x:0.02,xanchor:"left",y:0.02,yanchor:"bottom",font:{size:10},
+     legend:{x:0.02,xanchor:"left",y:0.02,yanchor:"bottom",font:{size:12},
              bgcolor:"rgba(22,27,34,0.6)",bordercolor:"#30363d",borderwidth:1}},
      {displayModeBar:false,responsive:true});
 
@@ -1081,9 +1081,9 @@ function render(r,s){
   const _zmin=Math.min(...r.bvd.mag,50), _zmax=Math.max(...r.bvd.mag,50);
   const _ylo=Math.floor(Math.log10(_zmin))-0.3, _yhi=Math.ceil(Math.log10(_zmax))+0.3;
   Plotly.react($("pBVD"),[{x:r.bvd.f,y:r.bvd.mag,line:{color:"#3fb950"}}],
-    {title:{text:`BVD |Z| — ${r.bvd.scope==="array"?"all channels ∥":"per channel"} (Qm=${r.bvd.Qm.toFixed(0)}, R₁=${r.bvd.R1.toFixed(0)}Ω, C₀=${r.bvd.C0.toFixed(0)}pF)`,font:{size:12,color:"#e6edf3"}},
-     margin:{l:54,r:10,t:34,b:40},paper_bgcolor:"#161b22",plot_bgcolor:"#161b22",
-     font:{color:"#8b949e",size:11},
+    {title:{text:`BVD |Z| — ${r.bvd.scope==="array"?"all channels ∥":"per channel"} (Qm=${r.bvd.Qm.toFixed(0)}, R₁=${r.bvd.R1.toFixed(0)}Ω, C₀=${r.bvd.C0.toFixed(0)}pF)`,font:{size:14,color:"#e6edf3"}},
+     margin:{l:58,r:10,t:38,b:44},paper_bgcolor:"#161b22",plot_bgcolor:"#161b22",
+     font:{color:"#8b949e",size:13},
      yaxis:{type:"log",title:"|Z| [Ω]",range:[_ylo,_yhi],dtick:1,tickformat:"~s",
             showgrid:true,gridcolor:"#484f58",griddash:"dot",gridwidth:1,
             minor:{showgrid:true,gridcolor:"#2d333b",griddash:"dot"}},
@@ -1096,7 +1096,7 @@ function render(r,s){
               line:{color:"#d29922",dash:"dash",width:1.5}}],
      annotations:[{x:0.02,xref:"paper",y:50,yref:"y",text:"50 Ω system",
               showarrow:false,xanchor:"left",yanchor:"bottom",
-              font:{size:9,color:"#d29922"}}]},{displayModeBar:false,responsive:true});
+              font:{size:11,color:"#d29922"}}]},{displayModeBar:false,responsive:true});
   }
 
   // ---- B-mode ----
@@ -1105,9 +1105,9 @@ function render(r,s){
      x0:bmx[0],dx:(bmx[1]-bmx[0])/(r.bm.img[0].length-1),
      y0:bmz[0],dy:(bmz[1]-bmz[0])/(r.bm.img.length-1),
      colorscale:[[0,"#000000"],[1,"#ffffff"]],showscale:false}],
-    {title:{text:"B-mode phantom (wire + cyst + speckle)",font:{size:13,color:"#e6edf3"}},
-     margin:{l:52,r:10,t:34,b:44},paper_bgcolor:"#161b22",plot_bgcolor:"#000000",
-     font:{color:"#8b949e",size:11},
+    {title:{text:"B-mode phantom (wire + cyst + speckle)",font:{size:15,color:"#e6edf3"}},
+     margin:{l:56,r:10,t:36,b:48},paper_bgcolor:"#161b22",plot_bgcolor:"#000000",
+     font:{color:"#8b949e",size:13},
      yaxis:{autorange:"reversed",title:"depth z [mm]",scaleanchor:"x",scaleratio:1,constrain:"domain"},
      xaxis:{title:"lateral x [mm]",constrain:"domain"}},{displayModeBar:false,responsive:true});
 
